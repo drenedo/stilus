@@ -2,7 +2,6 @@
 
 import argparse
 from pathlib import Path
-from urllib.parse import parse_qs
 
 import yaml
 from selenium import webdriver
@@ -12,7 +11,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
-GECKODRIVER_PATH = Path("/snap/bin/firefox.geckodriver")
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -29,14 +27,20 @@ def get_credentials(config: dict) -> tuple[str, str]:
     return name, password
 
 
-def create_driver() -> webdriver.Firefox:
+def get_geckodriver_path(config: dict) -> Path:
+    path = config.get("geckodriver")
+    if not path:
+        raise SystemExit("Missing geckodriver: set the geckodriver path in the YAML file.")
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(f"Geckodriver not found at {path}.")
+    return path
+
+
+def create_driver(config: dict) -> webdriver.Firefox:
     options = Options()
-    #options.add_argument("-headless")
-    service = (
-        webdriver.FirefoxService(executable_path=str(GECKODRIVER_PATH))
-        if GECKODRIVER_PATH.exists()
-        else None
-    )
+    options.add_argument("-headless")
+    service = webdriver.FirefoxService(executable_path=str(get_geckodriver_path(config)))
     driver = webdriver.Firefox(options=options, service=service)
     driver.implicitly_wait(10)
     return driver
@@ -47,16 +51,14 @@ def login(driver: webdriver.Firefox, name: str, password: str) -> None:
     wait.until(EC.visibility_of_element_located((By.ID, "userNameInput"))).send_keys(name)
     driver.find_element(By.ID, "passwordInput").send_keys(password)
     driver.find_element(By.ID, "submitButton").click()
-    wait.until(
-        lambda driver: driver.current_url.startswith("https://stilus.educa.jcyl.es"))
-    errors = [el.text.strip() for el in driver.find_elements(By.ID, "errorText") if el.text.strip()]
-    if errors:
-        raise SystemExit(f"Sign-in error: {errors[0]}")
+    print("checking url...")
+    wait.until(lambda driver: driver.current_url.startswith("https://stilus.educa.jcyl.es"))
+    print("checked!")
 
 
 def extract_token(url: str) -> str:
-    fragment = url.partition("#")[2]
-    token = parse_qs(fragment).get("access_token", [None])[0]
+    token = url.split("#access_token=")[1].split("&")[0]
+    print(f"Token: {token}")
     if not token:
         raise SystemExit(f"No access_token found in the redirect URL: {url}")
     return token
@@ -65,12 +67,13 @@ def extract_token(url: str) -> str:
 def get_token(config: dict | None = None, config_path: Path = CONFIG_PATH) -> str:
     config = config or load_config(config_path)
     name, password = get_credentials(config)
-    driver = create_driver()
+    driver = create_driver(config)
     try:
         driver.get(config["url"])
         login(driver, name, password)
         return extract_token(driver.current_url)
     finally:
+        driver.close()
         driver.quit()
 
 

@@ -9,3 +9,4 @@ venv/
 env/
 ENV/
 
+*.json
