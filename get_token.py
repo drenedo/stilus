@@ -1,4 +1,3 @@
-"""Obtain an access token from the Stilus portal via Selenium."""
 
 import argparse
 from pathlib import Path
