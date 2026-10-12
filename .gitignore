@@ -1,0 +1,11 @@
+config.yaml
+*.pem
+*.key
+.env
+.env.*
+
+venv/
+.venv/
+env/
+ENV/
+
