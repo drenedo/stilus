@@ -3,6 +3,7 @@ config.yaml
 *.key
 .env
 .env.*
+!.env.example
 
 venv/
 .venv/
@@ -10,3 +11,18 @@ env/
 ENV/
 
 *.json
+!package.json
+!package-lock.json
+!.prettierrc.json
+session.json
+read-state.json
+telegram.json
+telegram.lock
+server/telegram-cli.log
+server/telegram-cli.pid
+
+node_modules/
+frontend/dist/
+*.json.tmp
+__pycache__/
+.eslintcache
