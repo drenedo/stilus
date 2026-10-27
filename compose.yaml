@@ -6,6 +6,7 @@ x-app: &app
         dockerfile: Dockerfile
     image: stilus:local
     init: true
+    user: "${PUID:-10001}:${PGID:-10001}"
     shm_size: "1gb"
     restart: unless-stopped
 
@@ -23,8 +24,11 @@ services:
             PYTHON: /opt/venv/bin/python
             STILUS_CONFIG: /app/config.docker.yaml
             STILUS_DATA_DIR: /data
+            HOME: /tmp
+            TMPDIR: /tmp
+            COOKIE_SECURE: ${COOKIE_SECURE:-false}
         volumes:
-            - stilus-data:/data
+            - ${STILUS_DATA_PATH:-stilus-data}:/data
         healthcheck:
             test:
                 [
@@ -48,12 +52,14 @@ services:
             PYTHON: /opt/venv/bin/python
             STILUS_CONFIG: /app/config.docker.yaml
             STILUS_DATA_DIR: /data
+            HOME: /tmp
+            TMPDIR: /tmp
             TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
             TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
             STILUS_USER: ${STILUS_USER:-}
             STILUS_PASSWORD: ${STILUS_PASSWORD:-}
         volumes:
-            - stilus-data:/data
+            - ${STILUS_DATA_PATH:-stilus-data}:/data
 
 volumes:
     stilus-data:

@@ -3,7 +3,8 @@
 React 18 + Vite interface for Stilus. It provides:
 
 - A login screen for Educa credentials.
-- A session view with token generation time, on-demand renewal and logout.
+- A multi-user session view with per-browser cookies, token generation time,
+  on-demand renewal, logout and account deletion.
 - A family inbox with search, sender selection, child filters and unread state.
 - Message detail with Markdown, attachments and automatic read marking.
 - A Telegram configuration tab inside the account menu.
@@ -13,7 +14,7 @@ The UI text is in Spanish. Code, configuration and these docs are in English.
 
 ## Requirements
 
-- Node.js 18.18 or newer.
+- Node.js 20 or newer (the repository tooling uses Node 20).
 - A running Stilus API. By default the frontend expects it at
   `http://127.0.0.1:8000`.
 - A modern browser with support for `fetch`, `AbortController`,
@@ -130,9 +131,16 @@ On first load:
 4. Any other error is shown on the login screen.
 
 The login form calls `POST /api/login` with the username and password. On
-success the session is stored in React state and the inbox is rendered. The
-password and token are never stored in the browser; the token stays
-server-side.
+success the server creates a SQLite-backed browser session and sets an
+`HttpOnly`, `SameSite=Lax` cookie (`stilus_session`). React stores only the
+username and token generation time; the password and token never enter browser
+storage. Every fetch uses `credentials: "same-origin"`, so the cookie follows
+same-origin requests through the Vite proxy or the Express server.
+
+Different browsers can log in with different Stilus accounts at the same time:
+each browser presents its own cookie, and the server resolves the matching
+account. Opening a different account in the same browser replaces that browser's
+cookie but does not delete the previous account from SQLite.
 
 While a session exists, `App.jsx` calls `GET /api/token` every **5 minutes**
 and when the tab becomes visible again. This keeps the session state and
@@ -141,7 +149,11 @@ token while its `exp` is valid, and renews only after it has actually expired
 or when Stilus rejects it. A `401` clears the local session and returns to the
 login screen.
 
-Logout calls `POST /api/logout`, which deletes the server-side session file.
+Logout calls `POST /api/logout`, which deletes the current browser session and
+clears the cookie. The account and its encrypted credentials remain so token
+renewal and Telegram notifications can continue. The account menu also offers
+**Eliminar cuenta y datos guardados**, which calls `DELETE /api/account` after a
+confirmation and removes the account, read state and Telegram settings.
 
 ### Inbox
 
@@ -171,9 +183,9 @@ Selecting an unread message immediately:
 3. Keeps the state if the server saves it.
 4. Reverts to unread and shows an error if the request fails.
 
-The server persists read state per user in `read-state.json` and also tries to
-mark the message as read in Stilus. If the portal update fails but the local
-state was saved, the UI shows a warning notice.
+The server persists read state per Stilus account in SQLite (`read_state`) and
+also tries to mark the message as read in Stilus. If the portal update fails but
+the local state was saved, the UI shows a warning notice.
 
 If Stilus returns a `5xx` response while loading the inbox, the UI shows a
 specific upstream-outage warning instead of a generic error. It states that the
@@ -204,11 +216,15 @@ ask for permission to allow multiple downloads.
 
 The account dropdown has two tabs:
 
-- **Cuenta**: session generation time, token renewal, logout.
+- **Cuenta**: session generation time, token renewal, logout and account
+  deletion.
 - **Telegram**: bot configuration.
 
 The `Cuenta` tab shows when the current token was generated. The token itself
-is not displayed; it stays server-side.
+is not displayed; it stays server-side. The account menu explains that the
+account stays saved for automatic renewal and Telegram notifications. **Cerrar
+sesión** ends only this browser; **Eliminar cuenta y datos guardados** removes
+the account and all its server-side state after confirmation.
 
 The Telegram tab lets the user:
 
@@ -242,12 +258,13 @@ encryption, delivery details and the headless CLI.
 - `request(url, options)`: `fetch` wrapper with a 130-second timeout, JSON body
   parsing and a custom `ApiError` that exposes `status`.
 - `login`, `getToken`, `refreshToken`, `logout`.
-- `getInbox`, `markMessageRead`.
+- `deleteAccount`, `getInbox`, `markMessageRead`.
 - `getTelegramConfig`, `saveTelegramConfig`, `testTelegramConnection`,
   `discoverTelegramChat`, `deleteTelegramConfig`.
 
 All calls use same-origin `/api` URLs, which works with the Vite proxy and with
-the Express-served build.
+the Express-served build. Requests use `credentials: "same-origin"` so the
+server's `HttpOnly` session cookie is sent automatically.
 
 ## Styling
 

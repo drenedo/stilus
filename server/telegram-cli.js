@@ -165,7 +165,6 @@ const {
     discoverTelegramChats,
     loginAndPersist,
     pollTelegramNotifications,
-    releaseTelegramLock,
     saveTelegramConfig,
 } = await import("./index.js");
 
@@ -181,7 +180,6 @@ function cleanup() {
         clearInterval(timer);
         timer = null;
     }
-    releaseTelegramLock();
 
     if (process.env.STILUS_TELEGRAM_DAEMON === "1") {
         try {
@@ -210,10 +208,8 @@ process.on("SIGTERM", () => stop("SIGTERM"));
 
 try {
     console.log(`[${timestamp()}] Signing in to Stilus as ${username}…`);
-    const session = await loginAndPersist(username.trim(), password);
-    console.log(
-        `[${timestamp()}] Signed in. Token valid until ${session.expires_at}.`,
-    );
+    const { account } = await loginAndPersist(username.trim(), password);
+    console.log(`[${timestamp()}] Signed in as ${account.username}.`);
 
     let chatId = chatIdInput.trim();
     if (!chatId) {
@@ -230,7 +226,7 @@ try {
         );
     }
 
-    const config = await saveTelegramConfig(username.trim(), {
+    const config = await saveTelegramConfig(account.usernameKey, {
         botToken: botToken.trim(),
         chatId,
         enabled: true,
@@ -240,23 +236,25 @@ try {
         console.log(
             `[${timestamp()}] Marking current messages as already notified…`,
         );
-        await baselineTelegram(username.trim());
+        await baselineTelegram(account.usernameKey, account);
     }
 
     console.log(
-        `[${timestamp()}] Telegram notifications active for chat ${config.chat_id}.`,
+        `[${timestamp()}] Telegram notifications active for chat ${config.chatId}.`,
     );
     console.log(
         `Checking for new messages every ${intervalMinutes} minute(s). Press Ctrl+C to stop.`,
     );
 
     console.log(`[${timestamp()}] Checking for new messages…`);
-    await pollTelegramNotifications();
+    await pollTelegramNotifications({ usernameKey: account.usernameKey });
 
     const intervalMs = Math.max(1000, intervalMinutes * 60_000);
     timer = setInterval(() => {
         console.log(`[${timestamp()}] Checking for new messages…`);
-        void pollTelegramNotifications();
+        void pollTelegramNotifications({
+            usernameKey: account.usernameKey,
+        });
     }, intervalMs);
 } catch (error) {
     console.error(`[${timestamp()}] Error: ${error.message}`);

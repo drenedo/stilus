@@ -5,8 +5,10 @@ Express 5 API and headless Telegram CLI for Stilus.
 The server is responsible for:
 
 - Authenticating against Stilus through `../get_token.py` and Selenium.
-- Storing the session and credentials encrypted on disk.
-- Renewing the Stilus access token automatically.
+- Storing accounts, encrypted tokens, credentials, read state and Telegram
+  state in SQLite.
+- Issuing per-browser HttpOnly session cookies for multi-user access.
+- Renewing each Stilus access token automatically when it expires.
 - Fetching children and communications from the Stilus portal.
 - Merging the family inbox, tracking read state and proxying attachments.
 - Sending Telegram notifications for new messages, including attachments.
@@ -18,7 +20,7 @@ See [`../frontend/README.md`](../frontend/README.md) for the React UI.
 
 ## Requirements
 
-- Node.js 18.18 or newer (Node 20 is recommended).
+- Node.js 20 or newer (Node 20 is used by the Docker image).
 - Python 3.10 or newer.
 - A Python virtual environment with the root `requirements.txt` installed.
 - Firefox.
@@ -95,7 +97,8 @@ npm run telegram -- --help
 | `HOST`              | `127.0.0.1`                | Bind address. Keep localhost unless you really need remote access.               |
 | `PYTHON`            | auto-detected              | Python executable. It is tried before `venv/.venv/env`, then `python3`/`python`. |
 | `STILUS_CONFIG`     | `../config.yaml`           | Alternative YAML configuration path.                                             |
-| `STILUS_DATA_DIR`   | repository root            | Directory for session, read state and Telegram state. Used by Docker (`/data`).  |
+| `STILUS_DATA_DIR`   | repository root            | Directory for the SQLite database and `.session.key`. Used by Docker (`/data`).  |
+| `COOKIE_SECURE`     | `false`                    | Set to `true` behind HTTPS to add the cookie `Secure` attribute.                 |
 | `TELEGRAM_API_BASE` | `https://api.telegram.org` | Telegram Bot API base URL. Useful for tests or a self-hosted Bot API.            |
 
 ### Headless CLI
@@ -114,7 +117,8 @@ manually.
 
 ```text
 server/
-├── index.js           # Express API, session, portal, inbox, Telegram, pollers
+├── index.js           # Express API, accounts, portal, inbox, Telegram, pollers
+├── db.js              # SQLite schema and account/session/read/Telegram state
 ├── telegram-cli.js    # Headless Telegram mode
 ├── package.json       # Scripts and dependencies
 ├── package-lock.json
@@ -182,59 +186,80 @@ Timeout: 120 seconds. The browser/API error mapping is:
 `get_token.py` opens Firefox headless through Selenium, fills the ADFS login
 form and reads the token from the redirect URL fragment.
 
-### Session storage
+### Account and browser-session storage
 
-After a successful login the server writes `session.json` in the repository
-root:
+After a successful login the server creates or updates a row in the `accounts`
+table of `/data/stilus.sqlite` (or the repository root when `STILUS_DATA_DIR` is
+not set). Sensitive fields are encrypted with AES-256-GCM:
 
-```json
-{
-    "id": "uuid",
-    "username": "name@educa.jcyl.es",
-    "token": "...",
-    "obtained_at": "ISO date",
-    "credentials": {
-        "iv": "base64",
-        "tag": "base64",
-        "data": "base64"
-    }
-}
-```
+- `username` and a lowercase `username_key` used for uniqueness and lookups.
+- The encrypted access token and its `obtained_at` timestamp.
+- The encrypted username/password used for automatic renewal.
 
-The credentials object contains the username and password encrypted with
-AES-256-GCM. The key is generated lazily in `.session.key` as 32 random bytes
-(hex encoded) with mode `0600`. `session.json` is also written with `0600`.
+Each browser also receives an `HttpOnly`, `SameSite=Lax` cookie named
+`stilus_session`. The cookie contains 32 random bytes; SQLite stores only its
+SHA-256 hash in `web_sessions`, along with the account and expiry. Web sessions
+last 30 days. `COOKIE_SECURE=true` adds the `Secure` attribute when the UI is
+served over HTTPS.
 
-If `.session.key` is deleted, the encrypted credentials cannot be decrypted.
-The server reports an invalid session and the user must log in again.
+Other tables:
+
+| Table               | Purpose                                                      |
+| ------------------- | ------------------------------------------------------------ |
+| `accounts`          | One row per Stilus username, encrypted token/credentials.    |
+| `web_sessions`      | Hashed browser-session identifiers, account and expiry.      |
+| `read_state`        | Local read timestamps and enrolment IDs per account/message. |
+| `telegram_settings` | Per-account chat ID, encrypted bot token, status.            |
+| `telegram_notified` | Message UUIDs already sent, per account.                     |
+| `telegram_locks`    | Per-account cross-process polling lock and expiry.           |
+
+The encryption key is generated lazily in `.session.key` as 32 random bytes
+(hex encoded) with mode `0600`. The SQLite file and key are protected with mode
+`0600`; WAL/SHM files are created beside it. If `.session.key` is deleted, the
+encrypted credentials cannot be decrypted. The server invalidates that account's
+token, credentials and browser sessions; the user must log in again.
+
+Different browsers can hold different cookies and therefore different Stilus
+accounts. There is no single global session: every request resolves its account
+from the cookie. Two browsers using the same Stilus username intentionally share
+the account row, token, read state and Telegram settings.
 
 ### Token renewal
 
 The server reads the JWT `exp` internally, but it does **not** renew before the
 token expires and does **not** run a background renewal timer.
 
-- The stored token is used while it is valid.
+- Each account's stored token is used while it is valid.
 - When `now >= exp`, the next portal request (or `GET /api/token`) logs in again
-  with the stored credentials, stores the new token and continues.
+  with that account's stored credentials, stores the new token and continues.
 - A portal `401` also triggers a renewal and one retry.
-- `GET /api/token` returns the current token and renews only when it is already
-  expired.
+- `GET /api/token` returns the authenticated browser's current token and renews
+  it only when already expired.
 - `POST /api/token/refresh` forces a new login and token (the frontend's
   **Renovar token** action).
-- Renewals are single-flight: concurrent requests share one login attempt.
-- If the portal rejects the stored credentials (`401`), the session is deleted
-  and the UI returns to the login screen.
-- Timeouts and transient portal failures do not delete the session; they are
+- Renewals are single-flight per account within each process: concurrent
+  requests for the same account share one login attempt, while different
+  accounts are serialized by the global Selenium queue. The optional CLI is a
+  separate process, so avoid refreshing the same account from both at once.
+- If the portal rejects the stored credentials (`401`), that account's token and
+  credentials are cleared, its browser sessions are deleted, and its read state
+  and Telegram settings are kept for the next successful login.
+- Timeouts and transient portal failures do not invalidate the account; they are
   retried on a later request.
 
 The server writes a console message when a token is renewed. It never logs the
 token or password.
 
-### Logout
+### Logout and account deletion
 
-`POST /api/logout` deletes `session.json`. The encrypted Telegram configuration
-and local read state remain in place, so logging in again resumes the same
-history. Use `DELETE /api/telegram` to remove the Telegram integration.
+`POST /api/logout` deletes the current browser's `web_sessions` row and clears
+the cookie. The account, encrypted credentials, read state and Telegram
+configuration remain, so automatic renewal and Telegram notifications can
+continue. Use `DELETE /api/telegram` to remove only the Telegram integration.
+
+`DELETE /api/account` deletes the account row, all its browser sessions, read
+state, Telegram settings, notified UUIDs and locks. The frontend asks for
+confirmation before calling it.
 
 ## Stilus portal integration
 
@@ -268,7 +293,7 @@ perform the Stilus and Telegram requests themselves.
 3. Fetches each child's received, non-archived communications concurrently.
 4. Merges messages by `uuid`, so a message sent to two children appears once.
 5. Merges children, recipients and attachments without duplicates.
-6. Applies local read state from `read-state.json`.
+6. Applies the logged-in account's local read state from SQLite (`read_state`).
 7. Computes:
 
 ```json
@@ -314,29 +339,22 @@ recipient has read it in Stilus.
 
 ## Read state
 
-`read-state.json` is stored in the repository root:
+Read state is stored in SQLite, keyed by the lowercase account username and the
+message UUID:
 
-```json
-{
-    "users": {
-        "name@educa.jcyl.es": {
-            "messages": {
-                "uuid": {
-                    "read_at": "ISO date",
-                    "matricula_ids": [10038875, 10039211]
-                }
-            }
-        }
-    }
-}
-```
+| Column          | Content                                                    |
+| --------------- | ---------------------------------------------------------- |
+| `username_key`  | Account identity (lowercase username).                     |
+| `message_uuid`  | Stilus message UUID.                                       |
+| `read_at`       | First local read timestamp.                                |
+| `matricula_ids` | JSON array of enrolment IDs whose portal update was tried. |
 
 `POST /api/inbox/:uuid/read`:
 
-1. Requires a valid session.
+1. Requires a valid browser session and resolves its account.
 2. Validates the UUID.
 3. Requires `matricula_ids` in the JSON body.
-4. Saves the local read state first.
+4. Saves the local read state first, merging enrolment IDs.
 5. Calls the Stilus read endpoint for each supplied enrolment.
 6. Returns:
 
@@ -357,8 +375,9 @@ message from reappearing as unread locally.
 
 `GET /api/attachments/:uuid?name=<filename>`:
 
+- Requires the browser's session cookie and resolves its account.
 - Validates the UUID.
-- Fetches the file from Stilus with the stored bearer token.
+- Fetches the file from Stilus with that account's bearer token.
 - Uses `name` only for the download filename; the value is sanitized.
 - Sends `Content-Type`, `Content-Length`, `Content-Disposition` (ASCII fallback
   plus UTF-8 filename) and `Cache-Control: private, max-age=300`.
@@ -372,52 +391,40 @@ to Telegram as a document.
 
 ### Configuration storage
 
-Telegram settings are stored per user in `telegram.json` (repository root,
-`0600`):
+Telegram settings are stored per account in SQLite (`telegram_settings`) and the
+notified UUIDs in `telegram_notified`:
 
-```json
-{
-    "users": {
-        "name@educa.jcyl.es": {
-            "enabled": true,
-            "chat_id": "123456789",
-            "bot_token": {
-                "iv": "base64",
-                "tag": "base64",
-                "data": "base64"
-            },
-            "bot_token_hint": "abcd",
-            "initialized": true,
-            "notified": {
-                "uuid": "ISO date"
-            },
-            "updated_at": "ISO date",
-            "last_checked_at": "ISO date",
-            "last_sent_at": "ISO date",
-            "last_error": null
-        }
-    }
-}
-```
+| Column            | Content                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `username_key`    | Account identity (lowercase username).                   |
+| `enabled`         | Whether notifications are enabled.                       |
+| `chat_id`         | Destination chat or group ID.                            |
+| `bot_token`       | AES-256-GCM JSON payload; never returned to the browser. |
+| `bot_token_hint`  | Last four characters of the bot token.                   |
+| `initialized`     | Whether the current inbox was baselined.                 |
+| `last_checked_at` | Last poll time.                                          |
+| `last_sent_at`    | Last successful Telegram send.                           |
+| `last_error`      | Last polling error, if any.                              |
 
 The bot token is encrypted with AES-256-GCM using `.session.key`. The API never
 returns the token; it returns only the last four characters as a hint.
 
 ### Polling and delivery
 
-The server runs a Telegram poller every **5 minutes**, plus once at startup and
-after the headless CLI starts:
+The web server runs a Telegram poller every **5 minutes**, plus once at startup.
+The headless CLI also polls its own account. For each target account:
 
-1. Acquires `telegram.lock`.
-2. Reads the current session and the user's Telegram config.
-3. Loads the inbox.
+1. Claims a per-account row in `telegram_locks` with a 60-minute expiry.
+2. Loads the account, ensures its Stilus token is valid and decrypts the bot
+   token.
+3. Loads the inbox for that account.
 4. On the first configured run (`initialized: false`), marks all current
    messages as notified without sending them.
-5. For every message whose UUID is not in `notified`, oldest first:
+5. For every message whose UUID is not in `telegram_notified`, oldest first:
     - Sends the subject, sender, children, date, type, text and attachment count.
     - Sends each attachment as a Telegram document.
-    - Marks the message notified and updates `last_sent_at`.
-6. Records `last_checked_at` and `last_error`.
+    - Records the UUID and updates `last_sent_at`.
+6. Records `last_checked_at` and `last_error`, then releases the lock.
 
 Message text is split into chunks of up to 4000 characters. HTML entities are
 decoded and the portal's link notation is converted to plain URLs. Attachment
@@ -429,10 +436,11 @@ and are reported in the warning.
 
 ### Locking
 
-`telegram.lock` contains the PID of the process currently polling. It prevents
-the web server and the headless CLI from sending the same message twice. A
-stale lock whose PID no longer exists is removed automatically. The in-process
-`telegramPollInFlight` flag prevents overlapping polls in one process.
+`telegram_locks` has one row per account with the polling owner and an expiry.
+A second process skips an account that is already being polled. Expired rows are
+removed at the start of the next claim, so a crashed process cannot block
+notifications indefinitely. The in-process `telegramPollInFlight` flag prevents
+overlapping polls in one process.
 
 ### Baseline and downtime
 
@@ -468,8 +476,9 @@ first save baselines the current inbox.
 ## Headless Telegram CLI
 
 The CLI starts no Express server and serves no UI. It imports the shared logic,
-authenticates, stores the session and Telegram configuration, and keeps polling
-until stopped.
+authenticates, stores/updates its account and Telegram configuration in SQLite,
+and keeps polling until stopped. It polls only the account named in
+`STILUS_USER`; the web server polls every enabled account.
 
 ### Usage
 
@@ -523,9 +532,9 @@ Stop it with:
 npm run telegram -- --stop
 ```
 
-The CLI and the web server share `session.json` and `telegram.json`. The lock
-prevents duplicate Telegram polls, but running both continuously is
-unnecessary and token refreshes can race. Prefer one mode at a time. In Docker,
+The CLI and the web server share the SQLite database. Per-account database locks
+prevent duplicate Telegram polls and serialize token refreshes for the same
+account. Running both continuously is supported; the CLI is optional. In Docker,
 use the `telegram` compose service instead of `--detach`; the container runs in
 the foreground and Compose captures its logs.
 
@@ -563,21 +572,28 @@ Failures coming from Stilus include two extra fields:
 The frontend uses `source` and `upstream_status` to show a specific notice that
 the failure is in the Stilus backend, not in this application.
 
-| Method   | Route                             | Body / query                    | Description                                 |
-| -------- | --------------------------------- | ------------------------------- | ------------------------------------------- |
-| `GET`    | `/api/health`                     | -                               | `{"status":"ok"}`.                          |
-| `GET`    | `/api/token`                      | -                               | Return the current token; renew if expired. |
-| `POST`   | `/api/token/refresh`              | `{}`                            | Force a new login and token.                |
-| `POST`   | `/api/login`                      | `{username,password}`           | Authenticate and create the session.        |
-| `POST`   | `/api/logout`                     | `{}`                            | Delete the session.                         |
-| `GET`    | `/api/inbox`                      | -                               | Fetch and merge children/messages.          |
-| `POST`   | `/api/inbox/:uuid/read`           | `{matricula_ids:[...]}`         | Mark a message read locally and in Stilus.  |
-| `GET`    | `/api/attachments/:uuid?name=...` | -                               | Download an attachment (binary).            |
-| `GET`    | `/api/telegram`                   | -                               | Telegram configuration without the token.   |
-| `POST`   | `/api/telegram`                   | `{bot_token?,chat_id?,enabled}` | Save Telegram configuration.                |
-| `POST`   | `/api/telegram/test`              | `{bot_token?,chat_id?}`         | Send a test Telegram message.               |
-| `POST`   | `/api/telegram/discover`          | `{bot_token?}`                  | Detect recent Telegram chats.               |
-| `DELETE` | `/api/telegram`                   | -                               | Delete the Telegram configuration.          |
+| Method   | Route                             | Body / query                    | Description                                  |
+| -------- | --------------------------------- | ------------------------------- | -------------------------------------------- |
+| `GET`    | `/api/health`                     | -                               | `{"status":"ok"}`.                           |
+| `GET`    | `/api/token`                      | -                               | Return the current token; renew if expired.  |
+| `POST`   | `/api/token/refresh`              | `{}`                            | Force a new login and token.                 |
+| `POST`   | `/api/login`                      | `{username,password}`           | Authenticate and create the browser session. |
+| `POST`   | `/api/logout`                     | `{}`                            | Close the current browser session.           |
+| `DELETE` | `/api/account`                    | -                               | Delete the account and all its saved data.   |
+| `GET`    | `/api/inbox`                      | -                               | Fetch and merge children/messages.           |
+| `POST`   | `/api/inbox/:uuid/read`           | `{matricula_ids:[...]}`         | Mark a message read locally and in Stilus.   |
+| `GET`    | `/api/attachments/:uuid?name=...` | -                               | Download an attachment (binary).             |
+| `GET`    | `/api/telegram`                   | -                               | Telegram configuration without the token.    |
+| `POST`   | `/api/telegram`                   | `{bot_token?,chat_id?,enabled}` | Save Telegram configuration.                 |
+| `POST`   | `/api/telegram/test`              | `{bot_token?,chat_id?}`         | Send a test Telegram message.                |
+| `POST`   | `/api/telegram/discover`          | `{bot_token?}`                  | Detect recent Telegram chats.                |
+| `DELETE` | `/api/telegram`                   | -                               | Delete the Telegram configuration.           |
+
+Most routes require the browser's `stilus_session` cookie. `/api/health` and
+`/api/login` are public; `/api/logout` only clears the current cookie.
+Authentication is tied to the Stilus account; there is no separate application
+password. Use HTTPS and `COOKIE_SECURE=true` when the API is not restricted to
+localhost.
 
 All `POST` routes require `Content-Type: application/json`; otherwise the API
 returns `415`. Body size is limited to 16 KB. Unknown `/api` routes return
@@ -598,13 +614,14 @@ routes are matched first.
     "obtained_at": "2026-10-19T14:28:25.844Z",
     "renewed": false,
     "message": "Token actual.",
-    "saved_to": "session.json"
+    "saved_to": "stilus.sqlite"
 }
 ```
 
 `obtained_at` is when the current token was generated. `renewed` is `true`
 when the token was refreshed during the request. `saved_to` is only present on
-login. The `message` text depends on the operation.
+login. The `message` text depends on the operation. The login response also sets
+the `stilus_session` cookie.
 
 ### Telegram configuration response
 
@@ -669,18 +686,22 @@ Docker compose file uses the named volume `stilus-data` mounted at `/data`.
 
 | Path                      | Mode   | Purpose                                                         |
 | ------------------------- | ------ | --------------------------------------------------------------- |
-| `session.json`            | `0600` | Token, generation time, encrypted credentials.                  |
-| `.session.key`            | `0600` | AES-256-GCM key used for session and Telegram secrets.          |
-| `read-state.json`         | `0600` | Per-user local read state.                                      |
-| `telegram.json`           | `0600` | Per-user Telegram config, encrypted bot token, notified UUIDs.  |
-| `telegram.lock`           | `0600` | Cross-process Telegram poll lock (PID).                         |
+| `stilus.sqlite`           | `0600` | Accounts, hashed web sessions, read state and Telegram state.   |
+| `stilus.sqlite-wal`       | `0600` | SQLite write-ahead log while the server is running.             |
+| `stilus.sqlite-shm`       | `0600` | SQLite shared-memory file while the server is running.          |
+| `.session.key`            | `0600` | AES-256-GCM key used for tokens, credentials and bot tokens.    |
 | `server/telegram-cli.log` | `0600` | Detached CLI log (host mode only).                              |
 | `server/telegram-cli.pid` | `0600` | Detached CLI PID (host mode only).                              |
 | `config.yaml`             | user   | Optional YAML configuration for `get_token.py`/`get_alerts.py`. |
 
+`session.json`, `read-state.json`, `telegram.json` and `telegram.lock` from older
+versions are imported into SQLite and removed automatically on startup. If
+`session.json` cannot be read, it is left in place for recovery; the migration
+does not overwrite an existing account row.
+
 `config.yaml` may contain a plaintext password in its `user` block for the
 command-line scripts. Keep it out of Git. The web server and headless CLI take
-credentials from the form/CLI and store them encrypted in `session.json`.
+credentials from the form/CLI and store them encrypted in SQLite.
 
 ### Docker
 
@@ -702,57 +723,64 @@ root README for the exact commands, profiles, volume and environment variables.
 ## Security notes
 
 - The API binds to `127.0.0.1` by default. Do not expose it to an untrusted
-  network without adding authentication and HTTPS.
-- Credentials and the Telegram bot token are encrypted at rest with
-  AES-256-GCM. Anyone who can read both the data file and `.session.key` with
-  your OS account can decrypt them. For stronger isolation, use the OS
-  keychain or full-disk encryption.
+  network without HTTPS and a reverse proxy. Set `COOKIE_SECURE=true` when HTTPS
+  is in use.
+- Credentials, Stilus tokens and the Telegram bot token are encrypted at rest
+  with AES-256-GCM. Anyone who can read both the SQLite database and
+  `.session.key` with your OS account can decrypt them. For stronger isolation,
+  use full-disk encryption or a secrets manager.
+- Browser sessions are opaque random cookies (`HttpOnly`, `SameSite=Lax`); only
+  SHA-256 hashes are stored in SQLite. Web sessions expire after 30 days.
 - The Stilus password is sent to Python through stdin in the web flow, not in
   process arguments. CLI arguments are visible to local process listings;
   prefer environment variables.
-- The Stilus token is returned by `/api/token` for local tools; the web UI does
-  not display or store it. The Telegram bot token is never returned; only its
-  last four characters are shown.
+- The Stilus token is returned by `/api/token` only to an authenticated browser
+  session; the web UI does not display or store it. The Telegram bot token is
+  never returned; only its last four characters are shown.
 - Portal and Telegram requests use HTTPS by default.
-- `config.yaml` and all session/Telegram files are listed in `.gitignore`.
+- `config.yaml`, the database, the key and legacy session files are listed in
+  `.gitignore`.
 
 ## Limitations
 
-- One active Stilus session at a time (`session.json`). Read state and Telegram
-  config are stored per username, but only the current session polls.
+- One row per Stilus username, but multiple independent accounts and browser
+  sessions are supported. Two browsers using the same account share its token,
+  read state and Telegram settings.
 - Polling only. Stilus does not provide webhooks in this implementation.
 - Only received, non-archived communications are fetched.
 - The inbox does not send replies, archive messages or upload attachments.
 - Telegram notifications are one-way; the bot does not expose an interactive
   inbox or commands.
 - Telegram attachments are limited by the Bot API (50 MB per document).
-- No automated test suite or linter is configured.
+- There is no separate test suite yet; Prettier and ESLint are configured.
 - Portal endpoints and response shapes may change without notice.
-- Running the web server and headless CLI together shares session files and can
-  race on token renewal; prefer one mode.
+- The web server and headless CLI can run together, and SQLite locks prevent
+  duplicate Telegram polls. Token refreshes are single-flight per process only;
+  if both poll the same account, a simultaneous refresh can race, so the web
+  profile alone is recommended.
 
 ## Troubleshooting
 
-| Problem                                                        | Check                                                                                                           |
-| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `No se encontró un intérprete de Python con PyYAML y Selenium` | Create `venv` and install the root `requirements.txt`; or set `PYTHON`.                                         |
-| `ModuleNotFoundError: yaml` / `selenium`                       | The selected Python is not the venv; restart with `PYTHON=/path/to/venv/bin/python`.                            |
-| Login fails with `401`                                         | Wrong Educa credentials. The stored session was removed if this happened during a token renewal.                |
-| Login times out (`504`)                                        | Portal/network issue; the session is kept and retried.                                                          |
-| `Geckodriver not found`                                        | Point `geckodriver` in `config.yaml` to a valid binary, or remove it and let Selenium Manager resolve it.       |
-| Firefox does not start                                         | Install Firefox or check the geckodriver/Firefox version compatibility.                                         |
-| `415` on a POST                                                | Send `Content-Type: application/json`.                                                                          |
-| `401` from `/api/token`                                        | No session or invalid session; log in again.                                                                    |
-| `/api/inbox` returns `502/504`                                 | Portal error or timeout; retry. A `401` triggers a forced login and one retry.                                  |
-| Telegram test fails                                            | Check bot token and chat ID. The user must press `/start` in the bot first.                                     |
-| Telegram `getUpdates` fails                                    | A webhook may be configured for the bot; remove it or enter the chat ID manually.                               |
-| Telegram messages are not sent                                 | Check `telegram.json`: `enabled`, `chat_id`, `last_error`. The server must be running and a session must exist. |
-| Attachments return `502`                                       | Portal attachment unavailable or session rejected. Retry after a token renewal.                                 |
-| Port 8000 is already in use                                    | Stop the other process or set `PORT`.                                                                           |
-| `telegram.lock` remains                                        | Stale lock from a dead PID; the next poll removes it automatically, or delete it manually.                      |
-| `--stop` says no process                                       | The CLI was running in the foreground or the PID file was removed.                                              |
-| Session cannot be decrypted                                    | `.session.key` was deleted/changed. Log in again and re-enter the Telegram bot token.                           |
-| Frontend at `/` returns JSON                                   | `frontend/dist` does not exist; run `npm run build` in `frontend/`.                                             |
+| Problem                                                        | Check                                                                                                                                     |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `No se encontró un intérprete de Python con PyYAML y Selenium` | Create `venv` and install the root `requirements.txt`; or set `PYTHON`.                                                                   |
+| `ModuleNotFoundError: yaml` / `selenium`                       | The selected Python is not the venv; restart with `PYTHON=/path/to/venv/bin/python`.                                                      |
+| Login fails with `401`                                         | Wrong Educa credentials. The stored session was removed if this happened during a token renewal.                                          |
+| Login times out (`504`)                                        | Portal/network issue; the session is kept and retried.                                                                                    |
+| `Geckodriver not found`                                        | Point `geckodriver` in `config.yaml` to a valid binary, or remove it and let Selenium Manager resolve it.                                 |
+| Firefox does not start                                         | Install Firefox or check the geckodriver/Firefox version compatibility.                                                                   |
+| `415` on a POST                                                | Send `Content-Type: application/json`.                                                                                                    |
+| `401` from `/api/token`                                        | No session or invalid session; log in again.                                                                                              |
+| `/api/inbox` returns `502/504`                                 | Portal error or timeout; retry. A `401` triggers a forced login and one retry.                                                            |
+| Telegram test fails                                            | Check bot token and chat ID. The user must press `/start` in the bot first.                                                               |
+| Telegram `getUpdates` fails                                    | A webhook may be configured for the bot; remove it or enter the chat ID manually.                                                         |
+| Telegram messages are not sent                                 | Check the account's Telegram settings and `last_error`; the web server must be running and the account must still have valid credentials. |
+| Attachments return `502`                                       | Portal attachment unavailable or session rejected. Retry after a token renewal.                                                           |
+| Port 8000 is already in use                                    | Stop the other process or set `PORT`.                                                                                                     |
+| Telegram poll returns immediately                              | Another process holds that account's row in `telegram_locks`; wait for the 60-minute expiry or stop the other poller.                     |
+| `--stop` says no process                                       | The CLI was running in the foreground or the PID file was removed.                                                                        |
+| Session cannot be decrypted                                    | `.session.key` was deleted/changed. Log in again and re-enter the Telegram bot token.                                                     |
+| Frontend at `/` returns JSON                                   | `frontend/dist` does not exist; run `npm run build` in `frontend/`.                                                                       |
 
 ## Development notes
 

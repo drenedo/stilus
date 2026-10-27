@@ -16,7 +16,11 @@ async function request(url, options = {}) {
 
     let response;
     try {
-        response = await fetch(url, { ...options, signal: controller.signal });
+        response = await fetch(url, {
+            ...options,
+            credentials: "same-origin",
+            signal: controller.signal,
+        });
     } catch (error) {
         if (error.name === "AbortError") {
             throw new ApiError(
@@ -84,6 +88,10 @@ export function logout() {
         headers: JSON_HEADERS,
         body: "{}",
     });
+}
+
+export function deleteAccount() {
+    return request("/api/account", { method: "DELETE" });
 }
 
 export function getInbox() {

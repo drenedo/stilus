@@ -454,6 +454,7 @@ function AccountMenu({
     onRefresh,
     refreshing,
     onLogout,
+    onDeleteAccount,
     loggingOut,
 }) {
     const detailsRef = useRef(null);
@@ -767,7 +768,8 @@ function AccountMenu({
 
                         <p className="account__note">
                             El token de sesión se gestiona en el servidor y no
-                            se muestra aquí.
+                            se muestra aquí. La cuenta se conserva para renovar
+                            el token y enviar notificaciones de Telegram.
                         </p>
 
                         <button
@@ -803,9 +805,18 @@ function AccountMenu({
                             ) : (
                                 <>
                                     <LogoutIcon />
-                                    Olvidar sesión
+                                    Cerrar sesión
                                 </>
                             )}
+                        </button>
+
+                        <button
+                            type="button"
+                            className="secondary secondary--danger"
+                            onClick={onDeleteAccount}
+                            disabled={refreshing || loggingOut}
+                        >
+                            Eliminar cuenta y datos guardados
                         </button>
                     </>
                 ) : telegramLoading ? (
@@ -1097,6 +1108,7 @@ export default function Inbox({
     onRefresh,
     refreshing,
     onLogout,
+    onDeleteAccount,
     loggingOut,
     onUnauthorized,
     theme,
@@ -1461,6 +1473,7 @@ export default function Inbox({
                         onRefresh={onRefresh}
                         refreshing={refreshing}
                         onLogout={onLogout}
+                        onDeleteAccount={onDeleteAccount}
                         loggingOut={loggingOut}
                     />
                 </div>

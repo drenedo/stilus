@@ -17,6 +17,22 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---------------------------------------------------------------------------
+# Server dependencies (native SQLite module needs build tools)
+# ---------------------------------------------------------------------------
+FROM node:${NODE_VERSION}-bookworm AS server-deps
+
+WORKDIR /app/server
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY server/package.json server/package-lock.json ./
+RUN npm ci --omit=dev
+
+# ---------------------------------------------------------------------------
 # Runtime: Node + Python/Selenium + Firefox + geckodriver
 # ---------------------------------------------------------------------------
 FROM node:${NODE_VERSION}-bookworm AS runtime
@@ -73,18 +89,16 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Server dependencies.
-COPY server/package.json server/package-lock.json ./server/
-RUN cd server && npm ci --omit=dev
-
 # Application code and the built frontend.
 COPY get_token.py ./
 COPY server/ ./server/
+COPY --from=server-deps /app/server/node_modules ./server/node_modules
 COPY config.docker.yaml ./
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # Run as an unprivileged user; /data is the persistent state volume.
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
+RUN groupadd --gid 10001 app \
+    && useradd --create-home --uid 10001 --gid 10001 --shell /usr/sbin/nologin app \
     && mkdir -p /data \
     && chown -R app:app /data /home/app
 

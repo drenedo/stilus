@@ -2,50 +2,72 @@ import { spawn, spawnSync } from "node:child_process";
 import {
     createCipheriv,
     createDecipheriv,
+    createHash,
     randomBytes,
-    randomUUID,
 } from "node:crypto";
-import {
-    closeSync,
-    openSync,
-    readFileSync,
-    unlinkSync,
-    writeSync,
-} from "node:fs";
 import {
     access,
     chmod,
     mkdir,
     readFile,
-    rename,
     unlink,
     writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import cookieParser from "cookie-parser";
 import express from "express";
+
+import {
+    baselineTelegramNotified,
+    claimTelegramLock,
+    createWebSession,
+    deleteAccountData,
+    deleteTelegramSettings,
+    deleteWebSession,
+    getAccountById,
+    getAccountByUsernameKey,
+    getAccountForWebSession,
+    getDatabasePath,
+    getReadMessages,
+    getTelegramNotified,
+    getTelegramSettings,
+    importReadMessages,
+    importTelegramSettings,
+    initDatabase,
+    invalidateAccount,
+    listTelegramTargets,
+    markMessageRead,
+    markTelegramNotified,
+    releaseTelegramLock,
+    updateAccountToken,
+    updateTelegramStatus,
+    upsertAccount,
+    upsertTelegramSettings,
+} from "./db.js";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SERVER_DIR, "..");
 const DATA_DIR = path.resolve(process.env.STILUS_DATA_DIR || ROOT_DIR);
 const SCRIPT_PATH = path.join(ROOT_DIR, "get_token.py");
-const SESSION_PATH = path.join(DATA_DIR, "session.json");
 const KEY_PATH = path.join(DATA_DIR, ".session.key");
+const DATABASE_FILE_NAME = path.basename(getDatabasePath(DATA_DIR));
 const CONFIG_PATH =
     process.env.STILUS_CONFIG || path.join(ROOT_DIR, "config.yaml");
 const FRONTEND_DIR = path.join(ROOT_DIR, "frontend", "dist");
 const FRONTEND_INDEX = path.join(FRONTEND_DIR, "index.html");
-const SESSION_FILE_NAME = path.basename(SESSION_PATH);
 const PORT = Number(process.env.PORT) || 8000;
 const HOST = process.env.HOST || "127.0.0.1";
 const LOGIN_TIMEOUT_MS = 120_000;
-const READ_STATE_PATH = path.join(DATA_DIR, "read-state.json");
-const TELEGRAM_STORE_PATH = path.join(DATA_DIR, "telegram.json");
-const TELEGRAM_LOCK_PATH = path.join(DATA_DIR, "telegram.lock");
+const WEB_SESSION_COOKIE = "stilus_session";
+const WEB_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const COOKIE_SECURE =
+    String(process.env.COOKIE_SECURE ?? "").toLowerCase() === "true";
 const TELEGRAM_API_BASE =
     process.env.TELEGRAM_API_BASE || "https://api.telegram.org";
 const TELEGRAM_POLL_INTERVAL_MS = 5 * 60 * 1000;
+const TELEGRAM_LOCK_TTL_MS = 60 * 60 * 1000;
 const PORTAL_BASE_URL = "https://stilus.educa.jcyl.es/bkstfm";
 const PORTAL_TIMEOUT_MS = 30_000;
 const COMMUNICATIONS_PAGE_SIZE = 80;
@@ -57,14 +79,21 @@ const ALLOWED_ORIGINS = new Set([
     "http://127.0.0.1:5173",
 ]);
 
+// Keep the database, WAL/SHM files and the encryption key private on new files.
+process.umask(0o077);
+
 try {
     await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
     if (DATA_DIR !== ROOT_DIR) {
         await chmod(DATA_DIR, 0o700).catch(() => {});
     }
+    initDatabase(DATA_DIR);
 } catch (error) {
     console.error(
-        `Could not create data directory ${DATA_DIR}: ${error.message}`,
+        `Could not initialize data directory ${DATA_DIR}: ${error.message}`,
+    );
+    console.error(
+        "Check that the container user (PUID/PGID in Compose) owns and can write this directory.",
     );
     process.exit(1);
 }
@@ -348,50 +377,8 @@ async function decryptJson(payload) {
     return JSON.parse(plaintext);
 }
 
-function isValidSession(session) {
-    return Boolean(
-        session &&
-        typeof session === "object" &&
-        typeof session.id === "string" &&
-        typeof session.username === "string" &&
-        typeof session.token === "string" &&
-        session.token &&
-        session.credentials,
-    );
-}
-
-async function readSession() {
-    let content;
-    try {
-        content = await readFile(SESSION_PATH, "utf8");
-    } catch (error) {
-        if (error.code === "ENOENT") {
-            return null;
-        }
-        throw error;
-    }
-
-    try {
-        const session = JSON.parse(content);
-        if (!isValidSession(session)) {
-            throw new Error("La sesión guardada no tiene el formato esperado.");
-        }
-        return session;
-    } catch (error) {
-        console.error(`No se pudo leer ${SESSION_FILE_NAME}: ${error.message}`);
-        return null;
-    }
-}
-
-async function requireSession() {
-    const session = await readSession();
-    if (!session?.token) {
-        throw new ApiError(
-            401,
-            "No hay una sesión guardada. Inicia sesión para continuar.",
-        );
-    }
-    return session;
+function usernameKeyFor(username) {
+    return username.trim().toLocaleLowerCase("es");
 }
 
 function decodeJwtPayload(token) {
@@ -415,69 +402,107 @@ function getTokenExpiry(token) {
     return null;
 }
 
-function isTokenExpired(session) {
-    const expiry = getTokenExpiry(session.token);
+function isTokenExpired(token) {
+    const expiry = getTokenExpiry(token);
     return expiry !== null && expiry <= Date.now();
 }
 
-async function ensureValidSession() {
-    const session = await requireSession();
-    if (!isTokenExpired(session)) {
-        return { session, renewed: false };
+function parseStoredPayload(value) {
+    if (!value) {
+        return null;
     }
-    return refreshSession();
-}
 
-let sessionWriteQueue = Promise.resolve();
-
-function persistSession(session) {
-    const operation = sessionWriteQueue.then(async () => {
-        const temporaryPath = `${SESSION_PATH}.tmp`;
-        await writeFile(
-            temporaryPath,
-            `${JSON.stringify(session, null, 2)}\n`,
-            { encoding: "utf8", mode: 0o600 },
-        );
-        await chmod(temporaryPath, 0o600).catch(() => {});
-        await rename(temporaryPath, SESSION_PATH);
-    });
-
-    sessionWriteQueue = operation.catch(() => {});
-    return operation;
-}
-
-async function clearSession() {
-    await sessionWriteQueue.catch(() => {});
     try {
-        await unlink(SESSION_PATH);
-    } catch (error) {
-        if (error.code !== "ENOENT") {
-            throw error;
-        }
+        return JSON.parse(value);
+    } catch {
+        return null;
     }
 }
 
-async function createSession(token, username, password, id = randomUUID()) {
-    return {
-        id,
-        username,
-        token,
-        obtained_at: new Date().toISOString(),
-        credentials: await encryptJson({ username, password }),
-    };
+async function decryptAccountCredentials(account) {
+    const payload = parseStoredPayload(account?.credentials);
+    if (!payload) {
+        throw new ApiError(
+            401,
+            "No hay credenciales guardadas para esta cuenta. Inicia sesión de nuevo.",
+        );
+    }
+
+    let credentials;
+    try {
+        credentials = await decryptJson(payload);
+    } catch (error) {
+        console.error(
+            `No se pudieron descifrar las credenciales de ${account.username}: ${error.message}`,
+        );
+        invalidateAccount(account.id);
+        throw new ApiError(
+            401,
+            "Las credenciales guardadas no son válidas. Inicia sesión de nuevo.",
+        );
+    }
+
+    if (
+        typeof credentials?.username !== "string" ||
+        typeof credentials?.password !== "string"
+    ) {
+        invalidateAccount(account.id);
+        throw new ApiError(
+            401,
+            "Las credenciales guardadas no son válidas. Inicia sesión de nuevo.",
+        );
+    }
+
+    return credentials;
 }
 
-function sessionPayload(session, renewed = false) {
+async function decryptAccountToken(account) {
+    const payload = parseStoredPayload(account?.token);
+    if (!payload) {
+        throw new ApiError(
+            401,
+            "No hay una sesión guardada. Inicia sesión para continuar.",
+        );
+    }
+
+    let decrypted;
+    try {
+        decrypted = await decryptJson(payload);
+    } catch (error) {
+        console.error(
+            `No se pudo descifrar el token de ${account.username}: ${error.message}`,
+        );
+        invalidateAccount(account.id);
+        throw new ApiError(
+            401,
+            "La sesión guardada no es válida. Vuelve a iniciar sesión.",
+        );
+    }
+
+    if (typeof decrypted?.token !== "string" || !decrypted.token) {
+        invalidateAccount(account.id);
+        throw new ApiError(
+            401,
+            "La sesión guardada no es válida. Vuelve a iniciar sesión.",
+        );
+    }
+
+    return decrypted.token;
+}
+
+function sessionPayload(account, token, renewed = false) {
     return {
         status: "ok",
-        username: session.username,
-        token: session.token,
-        obtained_at: session.obtained_at,
+        username: account.username,
+        token,
+        obtained_at: account.obtainedAt,
         renewed,
     };
 }
 
-// Selenium opens a browser per login, so authentications are serialized.
+// Selenium opens a browser per login, so authentications are serialized in this
+// process. The optional CLI is a separate process; avoid refreshing the same
+// account from both at once.
 let authQueue = Promise.resolve();
 function enqueueAuthentication(task) {
     const result = authQueue.then(task, task);
@@ -490,175 +515,273 @@ function enqueueAuthentication(task) {
 
 async function loginAndPersist(username, password) {
     const token = await getTokenFromPython(python, username, password);
-    const session = await createSession(token, username, password);
-    await persistSession(session);
-    return session;
+    const account = upsertAccount({
+        username,
+        usernameKey: usernameKeyFor(username),
+        token: JSON.stringify(await encryptJson({ token })),
+        obtainedAt: new Date().toISOString(),
+        credentials: JSON.stringify(await encryptJson({ username, password })),
+    });
+
+    return { account, token };
 }
 
-let refreshPromise = null;
+const refreshPromises = new Map();
 
-function refreshSession() {
-    if (refreshPromise) {
-        return refreshPromise;
+function refreshAccount(account) {
+    const key = String(account.id);
+    if (refreshPromises.has(key)) {
+        return refreshPromises.get(key);
     }
 
-    refreshPromise = (async () => {
-        const session = await requireSession();
-
-        let credentials;
-        try {
-            credentials = await decryptJson(session.credentials);
-        } catch (error) {
-            console.error(
-                `No se pudieron descifrar las credenciales guardadas: ${error.message}`,
-            );
-            await clearSession();
+    const operation = (async () => {
+        const current = getAccountById(account.id);
+        if (!current?.token || !current?.credentials) {
             throw new ApiError(
                 401,
-                "La sesión guardada no es válida. Vuelve a iniciar sesión.",
+                "La sesión guardada no es válida. Inicia sesión de nuevo.",
             );
         }
 
-        if (
-            typeof credentials?.username !== "string" ||
-            typeof credentials?.password !== "string"
-        ) {
-            await clearSession();
-            throw new ApiError(
-                401,
-                "La sesión guardada no es válida. Vuelve a iniciar sesión.",
-            );
-        }
+        const credentials = await decryptAccountCredentials(current);
 
-        let outcome;
+        let token;
         try {
-            outcome = await enqueueAuthentication(async () => {
-                const token = await getTokenFromPython(
+            token = await enqueueAuthentication(() =>
+                getTokenFromPython(
                     python,
                     credentials.username,
                     credentials.password,
-                );
-
-                const current = await readSession();
-                // The user may have logged out or signed in with another account.
-                if (!current || current.id !== session.id) {
-                    return {
-                        session: current,
-                        renewed: false,
-                        superseded: true,
-                    };
-                }
-
-                const renewedSession = await createSession(
-                    token,
-                    credentials.username,
-                    credentials.password,
-                    session.id,
-                );
-                await persistSession(renewedSession);
-                return {
-                    session: renewedSession,
-                    renewed: true,
-                    superseded: false,
-                };
-            });
+                ),
+            );
         } catch (error) {
             if (error instanceof ApiError && error.status === 401) {
-                await clearSession();
+                invalidateAccount(current.id);
             }
             throw error;
         }
 
-        if (outcome.superseded) {
-            if (outcome.session) {
-                return { session: outcome.session, renewed: false };
-            }
-            throw new ApiError(
-                401,
-                "La sesión cambió mientras se renovaba el token. Inicia sesión de nuevo.",
-            );
-        }
-
-        console.log(`Token renewed for ${credentials.username}.`);
-        return { session: outcome.session, renewed: outcome.renewed };
-    })().finally(() => {
-        refreshPromise = null;
-    });
-
-    return refreshPromise;
-}
-
-let readStateQueue = Promise.resolve();
-
-async function readReadState() {
-    try {
-        const content = await readFile(READ_STATE_PATH, "utf8");
-        const state = JSON.parse(content);
-        if (!state || typeof state !== "object" || !state.users) {
-            return { users: {} };
-        }
-        return state;
-    } catch (error) {
-        if (error.code === "ENOENT") {
-            return { users: {} };
-        }
-        console.error(
-            `No se pudo leer ${path.basename(READ_STATE_PATH)}: ${error.message}`,
+        const renewed = updateAccountToken(
+            current.id,
+            JSON.stringify(await encryptJson({ token })),
+            new Date().toISOString(),
         );
-        return { users: {} };
-    }
-}
 
-function updateReadState(mutator) {
-    const operation = readStateQueue.then(async () => {
-        const state = await readReadState();
-        if (!state.users) {
-            state.users = {};
-        }
-        const result = await mutator(state);
-        const temporaryPath = `${READ_STATE_PATH}.tmp`;
-        await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-        });
-        await chmod(temporaryPath, 0o600).catch(() => {});
-        await rename(temporaryPath, READ_STATE_PATH);
-        return result;
+        console.log(`Token renewed for ${current.username}.`);
+        return { account: renewed, token, renewed: true };
+    })().finally(() => {
+        refreshPromises.delete(key);
     });
 
-    readStateQueue = operation.catch(() => {});
+    refreshPromises.set(key, operation);
     return operation;
 }
 
-function getUserReadMessages(state, username) {
-    const messages = state.users?.[username]?.messages;
-    if (!messages || typeof messages !== "object") {
-        return {};
+async function ensureAccountToken(account) {
+    const current = getAccountById(account.id);
+    if (!current?.token || !current?.credentials) {
+        throw new ApiError(
+            401,
+            "La sesión guardada no es válida. Inicia sesión de nuevo.",
+        );
     }
-    return messages;
+
+    const token = await decryptAccountToken(current);
+    if (isTokenExpired(token)) {
+        return refreshAccount(current);
+    }
+
+    return { account: current, token, renewed: false };
 }
 
-function markMessageLocallyRead(username, uuid, matriculaIds) {
-    return updateReadState((state) => {
-        const user = state.users[username] ?? { messages: {} };
-        if (!user.messages || typeof user.messages !== "object") {
-            user.messages = {};
-        }
-        state.users[username] = user;
+function hashSessionId(value) {
+    return createHash("sha256").update(value).digest("hex");
+}
 
-        const previous = user.messages[uuid] ?? {};
-        const ids = new Set([
-            ...(Array.isArray(previous.matricula_ids)
-                ? previous.matricula_ids
-                : []),
-            ...matriculaIds,
-        ]);
-        user.messages[uuid] = {
-            read_at: previous.read_at ?? new Date().toISOString(),
-            matricula_ids: [...ids],
-        };
-        return user.messages[uuid];
+function cookieOptions(maxAge) {
+    return {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: COOKIE_SECURE,
+        path: "/",
+        ...(maxAge ? { maxAge } : {}),
+    };
+}
+
+function startWebSession(response, accountId) {
+    const rawSessionId = randomBytes(32).toString("base64url");
+    const expiresAt = new Date(Date.now() + WEB_SESSION_TTL_MS).toISOString();
+
+    createWebSession({
+        accountId,
+        idHash: hashSessionId(rawSessionId),
+        expiresAt,
     });
+    response.cookie(
+        WEB_SESSION_COOKIE,
+        rawSessionId,
+        cookieOptions(WEB_SESSION_TTL_MS),
+    );
+
+    return rawSessionId;
+}
+
+function endWebSession(request, response) {
+    const rawSessionId = request.cookies?.[WEB_SESSION_COOKIE];
+    if (rawSessionId) {
+        deleteWebSession(hashSessionId(rawSessionId));
+    }
+    response.clearCookie(WEB_SESSION_COOKIE, cookieOptions());
+}
+
+function requireWebSession(request) {
+    const rawSessionId = request.cookies?.[WEB_SESSION_COOKIE];
+    if (!rawSessionId) {
+        throw new ApiError(
+            401,
+            "No hay una sesión guardada. Inicia sesión para continuar.",
+        );
+    }
+
+    const sessionHash = hashSessionId(rawSessionId);
+    const account = getAccountForWebSession(sessionHash);
+    if (!account) {
+        throw new ApiError(
+            401,
+            "La sesión del navegador ha caducado. Inicia sesión de nuevo.",
+        );
+    }
+
+    return { account, sessionHash };
+}
+
+function getUserReadMessages(usernameKey) {
+    return getReadMessages(usernameKey);
+}
+
+function markMessageLocallyRead(usernameKey, uuid, matriculaIds) {
+    return markMessageRead(usernameKey, uuid, matriculaIds);
+}
+
+async function removeLegacyFile(filePath) {
+    try {
+        await unlink(filePath);
+    } catch (error) {
+        if (error.code !== "ENOENT") {
+            console.error(
+                `No se pudo eliminar ${path.basename(filePath)}: ${error.message}`,
+            );
+        }
+    }
+}
+
+async function migrateLegacyState() {
+    const legacySessionPath = path.join(DATA_DIR, "session.json");
+    const legacyReadStatePath = path.join(DATA_DIR, "read-state.json");
+    const legacyTelegramPath = path.join(DATA_DIR, "telegram.json");
+    const legacyTelegramLockPath = path.join(DATA_DIR, "telegram.lock");
+    let migratedSomething = false;
+
+    if (await pathExists(legacySessionPath)) {
+        let legacySession;
+        try {
+            legacySession = JSON.parse(
+                await readFile(legacySessionPath, "utf8"),
+            );
+        } catch (error) {
+            console.error(
+                `No se pudo leer session.json para migrarlo: ${error.message}`,
+            );
+        }
+
+        if (
+            typeof legacySession?.username === "string" &&
+            typeof legacySession?.token === "string" &&
+            legacySession.token &&
+            legacySession.credentials
+        ) {
+            const legacyUsernameKey = usernameKeyFor(legacySession.username);
+            if (!getAccountByUsernameKey(legacyUsernameKey)) {
+                try {
+                    upsertAccount({
+                        username: legacySession.username,
+                        usernameKey: legacyUsernameKey,
+                        token: JSON.stringify(
+                            await encryptJson({ token: legacySession.token }),
+                        ),
+                        obtainedAt:
+                            legacySession.obtained_at ??
+                            new Date().toISOString(),
+                        credentials: JSON.stringify(legacySession.credentials),
+                    });
+                    migratedSomething = true;
+                } catch (error) {
+                    console.error(
+                        `No se pudo migrar la sesión a SQLite: ${error.message}`,
+                    );
+                }
+            } else {
+                migratedSomething = true;
+            }
+        } else if (legacySession) {
+            console.error(
+                "session.json no tiene el formato esperado; no se migró.",
+            );
+        }
+
+        if (migratedSomething) {
+            await removeLegacyFile(legacySessionPath);
+        }
+    }
+
+    if (await pathExists(legacyReadStatePath)) {
+        try {
+            const readState = JSON.parse(
+                await readFile(legacyReadStatePath, "utf8"),
+            );
+            for (const [username, user] of Object.entries(
+                readState?.users ?? {},
+            )) {
+                if (user?.messages) {
+                    importReadMessages(usernameKeyFor(username), user.messages);
+                }
+            }
+            await removeLegacyFile(legacyReadStatePath);
+            migratedSomething = true;
+        } catch (error) {
+            console.error(
+                `No se pudo migrar read-state.json: ${error.message}`,
+            );
+        }
+    }
+
+    if (await pathExists(legacyTelegramPath)) {
+        try {
+            const telegramStore = JSON.parse(
+                await readFile(legacyTelegramPath, "utf8"),
+            );
+            for (const [username, config] of Object.entries(
+                telegramStore?.users ?? {},
+            )) {
+                const key = usernameKeyFor(username);
+                if (!getTelegramSettings(key)) {
+                    importTelegramSettings(key, config);
+                }
+            }
+            await removeLegacyFile(legacyTelegramPath);
+            migratedSomething = true;
+        } catch (error) {
+            console.error(`No se pudo migrar telegram.json: ${error.message}`);
+        }
+    }
+
+    await removeLegacyFile(legacyTelegramLockPath);
+
+    if (migratedSomething) {
+        console.log(
+            "Datos antiguos migrados a SQLite; los JSON de sesión han sido eliminados.",
+        );
+    }
 }
 
 function childFullName(child) {
@@ -668,34 +791,28 @@ function childFullName(child) {
         .trim();
 }
 
-async function portalRequestWithAuth(pathname, options = {}) {
+async function portalRequestWithAuth(account, pathname, options = {}) {
     try {
-        let { session } = await ensureValidSession();
-        let response = await fetch(`${PORTAL_BASE_URL}${pathname}`, {
-            ...options,
-            headers: {
-                Accept: "application/json",
-                Authorization: `Bearer ${session.token}`,
-                ...(options.headers ?? {}),
-            },
-            signal: AbortSignal.timeout(PORTAL_TIMEOUT_MS),
-        });
-
-        if (
-            response.status === 401 ||
-            (response.status === 500 && isTokenExpired(session))
-        ) {
-            const refreshed = await refreshSession();
-            session = refreshed.session;
-            response = await fetch(`${PORTAL_BASE_URL}${pathname}`, {
+        let auth = await ensureAccountToken(account);
+        const send = () =>
+            fetch(`${PORTAL_BASE_URL}${pathname}`, {
                 ...options,
                 headers: {
                     Accept: "application/json",
-                    Authorization: `Bearer ${session.token}`,
+                    Authorization: `Bearer ${auth.token}`,
                     ...(options.headers ?? {}),
                 },
                 signal: AbortSignal.timeout(PORTAL_TIMEOUT_MS),
             });
+
+        let response = await send();
+
+        if (
+            response.status === 401 ||
+            (response.status === 500 && isTokenExpired(auth.token))
+        ) {
+            auth = await refreshAccount(auth.account);
+            response = await send();
         }
 
         return response;
@@ -751,13 +868,16 @@ async function readPortalResponse(response, action) {
     );
 }
 
-async function fetchChildren() {
-    const response = await portalRequestWithAuth("/matriculas/educacyl");
+async function fetchChildren(account) {
+    const response = await portalRequestWithAuth(
+        account,
+        "/matriculas/educacyl",
+    );
     const data = await readPortalResponse(response, "obtener las matrículas");
     return (data?.datos ?? []).filter((child) => child.habilitada !== false);
 }
 
-async function fetchCommunicationsForChild(child) {
+async function fetchCommunicationsForChild(account, child) {
     const messages = [];
     let page = 1;
     let totalPages = 1;
@@ -771,6 +891,7 @@ async function fetchCommunicationsForChild(child) {
             sort: "-fechaComunicacion",
         });
         const response = await portalRequestWithAuth(
+            account,
             `/comunicaciones/${encodeURIComponent(child.matriculaId)}?${params.toString()}`,
         );
         const data = await readPortalResponse(
@@ -908,26 +1029,27 @@ function mergeInbox(children, results, readMessages) {
     };
 }
 
-async function fetchInboxData() {
-    const { session } = await ensureValidSession();
-    const children = await fetchChildren();
+async function fetchInboxData(account) {
+    const auth = await ensureAccountToken(account);
+    const current = auth.account;
+    const children = await fetchChildren(current);
     const results = await Promise.all(
         children.map(async (child) => ({
             child,
-            messages: await fetchCommunicationsForChild(child),
+            messages: await fetchCommunicationsForChild(current, child),
         })),
     );
 
-    const readState = await readReadState();
-    const readMessages = getUserReadMessages(readState, session.username);
+    const readMessages = getUserReadMessages(current.usernameKey);
     const inbox = mergeInbox(children, results, readMessages);
-    return { session, inbox };
+    return { account: current, inbox };
 }
 
-async function markPortalRead(matriculaIds, uuid) {
+async function markPortalRead(account, matriculaIds, uuid) {
     const results = await Promise.allSettled(
         matriculaIds.map(async (matriculaId) => {
             const response = await portalRequestWithAuth(
+                account,
                 `/comunicaciones/lecturas/${encodeURIComponent(matriculaId)}`,
                 {
                     method: "PATCH",
@@ -967,109 +1089,6 @@ function contentDisposition(filename) {
     return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }
 
-let telegramStoreQueue = Promise.resolve();
-
-function acquireTelegramLock() {
-    const pid = String(process.pid);
-
-    try {
-        const descriptor = openSync(TELEGRAM_LOCK_PATH, "wx", 0o600);
-        writeSync(descriptor, pid);
-        closeSync(descriptor);
-        return true;
-    } catch (error) {
-        if (error.code !== "EEXIST") {
-            throw error;
-        }
-    }
-
-    try {
-        const existing = Number(
-            readFileSync(TELEGRAM_LOCK_PATH, "utf8").trim(),
-        );
-
-        if (existing && existing !== process.pid) {
-            try {
-                process.kill(existing, 0);
-                return false;
-            } catch (error) {
-                if (error.code !== "ESRCH") {
-                    return false;
-                }
-                unlinkSync(TELEGRAM_LOCK_PATH);
-                return acquireTelegramLock();
-            }
-        }
-
-        return false;
-    } catch {
-        try {
-            unlinkSync(TELEGRAM_LOCK_PATH);
-        } catch {
-            // Ignore cleanup errors and retry once.
-        }
-        return acquireTelegramLock();
-    }
-}
-
-function releaseTelegramLock() {
-    try {
-        const existing = Number(
-            readFileSync(TELEGRAM_LOCK_PATH, "utf8").trim(),
-        );
-        if (existing === process.pid) {
-            unlinkSync(TELEGRAM_LOCK_PATH);
-        }
-    } catch {
-        // The lock may have already been removed.
-    }
-}
-
-async function readTelegramStore() {
-    try {
-        const content = await readFile(TELEGRAM_STORE_PATH, "utf8");
-        const store = JSON.parse(content);
-        if (
-            !store ||
-            typeof store !== "object" ||
-            !store.users ||
-            typeof store.users !== "object"
-        ) {
-            return { users: {} };
-        }
-        return store;
-    } catch (error) {
-        if (error.code === "ENOENT") {
-            return { users: {} };
-        }
-        console.error(
-            `No se pudo leer ${path.basename(TELEGRAM_STORE_PATH)}: ${error.message}`,
-        );
-        return { users: {} };
-    }
-}
-
-function updateTelegramStore(mutator) {
-    const operation = telegramStoreQueue.then(async () => {
-        const store = await readTelegramStore();
-        if (!store.users) {
-            store.users = {};
-        }
-        const result = await mutator(store);
-        const temporaryPath = `${TELEGRAM_STORE_PATH}.tmp`;
-        await writeFile(temporaryPath, `${JSON.stringify(store, null, 2)}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-        });
-        await chmod(temporaryPath, 0o600).catch(() => {});
-        await rename(temporaryPath, TELEGRAM_STORE_PATH);
-        return result;
-    });
-
-    telegramStoreQueue = operation.catch(() => {});
-    return operation;
-}
-
 function publicTelegramConfig(config) {
     if (!config) {
         return {
@@ -1089,84 +1108,72 @@ function publicTelegramConfig(config) {
         status: "ok",
         configured: true,
         enabled: Boolean(config.enabled),
-        chat_id: config.chat_id ?? null,
-        bot_token_hint: config.bot_token_hint ?? null,
+        chat_id: config.chatId ?? null,
+        bot_token_hint: config.botTokenHint ?? null,
         initialized: Boolean(config.initialized),
-        last_checked_at: config.last_checked_at ?? null,
-        last_sent_at: config.last_sent_at ?? null,
-        last_error: config.last_error ?? null,
+        last_checked_at: config.lastCheckedAt ?? null,
+        last_sent_at: config.lastSentAt ?? null,
+        last_error: config.lastError ?? null,
     };
 }
 
-async function getTelegramConfig(username) {
-    const store = await readTelegramStore();
-    return store.users?.[username] ?? null;
-}
+async function saveTelegramConfig(usernameKey, { botToken, chatId, enabled }) {
+    const previous = getTelegramSettings(usernameKey);
+    let encryptedToken = previous?.botToken ?? null;
+    let tokenHint = previous?.botTokenHint ?? null;
+    const trimmedToken = typeof botToken === "string" ? botToken.trim() : "";
 
-async function saveTelegramConfig(username, { botToken, chatId, enabled }) {
-    const now = new Date().toISOString();
+    if (trimmedToken) {
+        encryptedToken = JSON.stringify(
+            await encryptJson({ token: trimmedToken }),
+        );
+        tokenHint = trimmedToken.slice(-4);
+    }
 
-    return updateTelegramStore(async (store) => {
-        const previous = store.users[username] ?? null;
-        let encryptedToken = previous?.bot_token ?? null;
-        let tokenHint = previous?.bot_token_hint ?? null;
-        const trimmedToken =
-            typeof botToken === "string" ? botToken.trim() : "";
+    if (!encryptedToken) {
+        throw new ApiError(422, "Introduce el token del bot de Telegram.");
+    }
 
-        if (trimmedToken) {
-            encryptedToken = await encryptJson({ token: trimmedToken });
-            tokenHint = trimmedToken.slice(-4);
-        }
+    const trimmedChatId = typeof chatId === "string" ? chatId.trim() : "";
+    const effectiveChatId = trimmedChatId || previous?.chatId || "";
 
-        if (!encryptedToken) {
-            throw new ApiError(422, "Introduce el token del bot de Telegram.");
-        }
+    if (enabled && !effectiveChatId) {
+        throw new ApiError(
+            422,
+            "Introduce el chat ID de Telegram o usa Detectar chat.",
+        );
+    }
 
-        const trimmedChatId = typeof chatId === "string" ? chatId.trim() : "";
-        const effectiveChatId = trimmedChatId || previous?.chat_id || "";
-
-        if (enabled && !effectiveChatId) {
-            throw new ApiError(
-                422,
-                "Introduce el chat ID de Telegram o usa Detectar chat.",
-            );
-        }
-
-        const config = {
-            ...(previous ?? {}),
-            enabled: Boolean(enabled),
-            chat_id: effectiveChatId,
-            bot_token: encryptedToken,
-            bot_token_hint: tokenHint,
-            updated_at: now,
-            initialized: previous?.initialized ?? false,
-            notified: previous?.notified ?? {},
-            last_checked_at: previous?.last_checked_at ?? null,
-            last_sent_at: previous?.last_sent_at ?? null,
-            last_error: previous?.last_error ?? null,
-        };
-
-        store.users[username] = config;
-        return config;
+    return upsertTelegramSettings({
+        usernameKey,
+        enabled: Boolean(enabled),
+        chatId: effectiveChatId,
+        botToken: encryptedToken,
+        botTokenHint: tokenHint,
+        initialized: previous?.initialized ?? false,
     });
 }
 
-async function baselineTelegram(username) {
+async function baselineTelegram(usernameKey, account = null) {
     try {
-        const { inbox } = await fetchInboxData();
-        const now = new Date().toISOString();
-
-        await updateTelegramStore((store) => {
-            const config = store.users[username];
-            if (!config) {
-                return;
-            }
-            config.initialized = true;
-            config.notified = Object.fromEntries(
-                inbox.messages.map((message) => [message.uuid, now]),
+        const current = account ?? getAccountByUsernameKey(usernameKey);
+        if (!current) {
+            throw new Error(
+                "No hay una cuenta activa para inicializar Telegram.",
             );
-            config.last_checked_at = now;
-            config.last_error = null;
+        }
+
+        const { inbox } = await fetchInboxData(current);
+        const now = new Date().toISOString();
+        baselineTelegramNotified(
+            usernameKey,
+            inbox.messages.map((message) => message.uuid),
+            now,
+        );
+        updateTelegramStatus(usernameKey, {
+            checkedAt: now,
+            error: null,
+            initialized: true,
         });
     } catch (error) {
         console.error(
@@ -1175,14 +1182,15 @@ async function baselineTelegram(username) {
     }
 }
 
-async function resolveTelegramCredentials(username, overrides = {}) {
-    const config = await getTelegramConfig(username);
+async function resolveTelegramCredentials(usernameKey, overrides = {}) {
+    const config = getTelegramSettings(usernameKey);
     let token =
         typeof overrides.botToken === "string" ? overrides.botToken.trim() : "";
 
-    if (!token && config?.bot_token) {
+    if (!token && config?.botToken) {
         try {
-            const decrypted = await decryptJson(config.bot_token);
+            const payload = parseStoredPayload(config.botToken);
+            const decrypted = payload ? await decryptJson(payload) : null;
             token = typeof decrypted?.token === "string" ? decrypted.token : "";
         } catch {
             throw new ApiError(
@@ -1198,7 +1206,7 @@ async function resolveTelegramCredentials(username, overrides = {}) {
 
     const overrideChatId =
         typeof overrides.chatId === "string" ? overrides.chatId.trim() : "";
-    const chatId = overrideChatId || (config?.chat_id ?? "").trim();
+    const chatId = overrideChatId || (config?.chatId ?? "").trim();
 
     return { token, chatId, config };
 }
@@ -1351,8 +1359,9 @@ async function telegramSendText(token, chatId, text) {
     }
 }
 
-async function telegramSendDocument(token, chatId, attachment) {
+async function telegramSendDocument(token, chatId, attachment, account) {
     const portalResponse = await portalRequestWithAuth(
+        account,
         `/adjuntos/${encodeURIComponent(attachment.uuid)}`,
         { headers: { Accept: "*/*" } },
     );
@@ -1403,13 +1412,13 @@ async function telegramSendDocument(token, chatId, attachment) {
     }
 }
 
-async function sendTelegramMessage(token, chatId, message) {
+async function sendTelegramMessage(token, chatId, message, account) {
     await telegramSendText(token, chatId, telegramMessageText(message));
 
     const failed = [];
     for (const attachment of message.adjuntos ?? []) {
         try {
-            await telegramSendDocument(token, chatId, attachment);
+            await telegramSendDocument(token, chatId, attachment, account);
         } catch (error) {
             console.error(
                 `Telegram: could not send attachment ${attachment.nombre}: ${error.message}`,
@@ -1432,71 +1441,54 @@ async function sendTelegramMessage(token, chatId, message) {
 }
 
 let telegramPollInFlight = false;
+const telegramPollOwner = `${process.pid}-${randomBytes(8).toString("hex")}`;
 
-async function pollTelegramNotifications() {
-    if (telegramPollInFlight) {
+async function processTelegramTarget({ account, settings }) {
+    const usernameKey = account.usernameKey;
+    if (
+        !claimTelegramLock(usernameKey, telegramPollOwner, TELEGRAM_LOCK_TTL_MS)
+    ) {
         return;
     }
-
-    let locked = false;
-    try {
-        locked = acquireTelegramLock();
-    } catch (error) {
-        console.error(`Telegram: could not acquire the lock: ${error.message}`);
-        return;
-    }
-
-    if (!locked) {
-        return;
-    }
-
-    telegramPollInFlight = true;
 
     try {
-        const session = await readSession();
-        if (!session?.username) {
-            return;
+        const botPayload = parseStoredPayload(settings.botToken);
+        if (!botPayload) {
+            throw new Error("No hay un token de bot guardado.");
         }
 
-        const config = await getTelegramConfig(session.username);
-        if (!config?.enabled || !config.bot_token || !config.chat_id) {
-            return;
-        }
-
-        let credentials;
+        let botToken;
         try {
-            credentials = await decryptJson(config.bot_token);
+            const decrypted = await decryptJson(botPayload);
+            botToken = decrypted?.token;
         } catch (error) {
-            console.error(
-                `Telegram: could not decrypt the stored token: ${error.message}`,
+            throw new Error(
+                `No se pudo descifrar el token del bot: ${error.message}`,
             );
-            return;
         }
 
-        if (!credentials?.token) {
-            return;
+        if (typeof botToken !== "string" || !botToken) {
+            throw new Error("El token del bot guardado no es válido.");
         }
 
-        const { inbox } = await fetchInboxData();
-        const now = new Date().toISOString();
+        const { inbox } = await fetchInboxData(account);
+        const checkedAt = new Date().toISOString();
 
-        if (!config.initialized) {
-            await updateTelegramStore((store) => {
-                const current = store.users[session.username];
-                if (!current) {
-                    return;
-                }
-                current.initialized = true;
-                current.notified = Object.fromEntries(
-                    inbox.messages.map((message) => [message.uuid, now]),
-                );
-                current.last_checked_at = now;
-                current.last_error = null;
+        if (!settings.initialized) {
+            baselineTelegramNotified(
+                usernameKey,
+                inbox.messages.map((message) => message.uuid),
+                checkedAt,
+            );
+            updateTelegramStatus(usernameKey, {
+                checkedAt,
+                error: null,
+                initialized: true,
             });
             return;
         }
 
-        const notified = config.notified ?? {};
+        const notified = getTelegramNotified(usernameKey);
         const newMessages = inbox.messages
             .filter((message) => !notified[message.uuid])
             .sort((first, second) =>
@@ -1510,62 +1502,79 @@ async function pollTelegramNotifications() {
         for (const message of newMessages) {
             try {
                 await sendTelegramMessage(
-                    credentials.token,
-                    config.chat_id,
+                    botToken,
+                    settings.chatId,
                     message,
+                    account,
                 );
                 const sentAt = new Date().toISOString();
-                await updateTelegramStore((store) => {
-                    const current = store.users[session.username];
-                    if (!current) {
-                        return;
-                    }
-                    current.notified = {
-                        ...(current.notified ?? {}),
-                        [message.uuid]: sentAt,
-                    };
-                    current.last_sent_at = sentAt;
-                    current.last_error = null;
+                markTelegramNotified(usernameKey, message.uuid, sentAt);
+                updateTelegramStatus(usernameKey, {
+                    sentAt,
+                    error: null,
                 });
                 console.log(
-                    `Telegram: sent "${message.asunto}" (${message.uuid}).`,
+                    `Telegram: sent "${message.asunto}" (${message.uuid}) for ${account.username}.`,
                 );
             } catch (error) {
                 failure = error;
                 console.error(
-                    `Telegram: could not notify message ${message.uuid}: ${error.message}`,
+                    `Telegram: could not notify message ${message.uuid} for ${account.username}: ${error.message}`,
                 );
                 break;
             }
         }
 
-        await updateTelegramStore((store) => {
-            const current = store.users[session.username];
-            if (current) {
-                current.last_checked_at = new Date().toISOString();
-                current.last_error = failure ? failure.message : null;
-            }
+        updateTelegramStatus(usernameKey, {
+            checkedAt: new Date().toISOString(),
+            error: failure ? failure.message : null,
         });
+    } catch (error) {
+        console.error(
+            `Telegram error for ${account.username}: ${error.message}`,
+        );
+        updateTelegramStatus(usernameKey, {
+            checkedAt: new Date().toISOString(),
+            error: error.message,
+        });
+    } finally {
+        releaseTelegramLock(usernameKey, telegramPollOwner);
+    }
+}
+
+async function pollTelegramNotifications({ usernameKey = null } = {}) {
+    if (telegramPollInFlight) {
+        return;
+    }
+
+    telegramPollInFlight = true;
+
+    try {
+        const targets = listTelegramTargets(usernameKey);
+        for (const target of targets) {
+            await processTelegramTarget(target);
+        }
     } catch (error) {
         console.error(`Telegram error: ${error.message}`);
     } finally {
         telegramPollInFlight = false;
-        releaseTelegramLock();
     }
 }
 
 const app = express();
 app.disable("x-powered-by");
+app.use(cookieParser());
 app.use(express.json({ limit: "16kb" }));
 
 app.use((request, response, next) => {
     const origin = request.headers.origin;
     if (origin && ALLOWED_ORIGINS.has(origin)) {
         response.setHeader("Access-Control-Allow-Origin", origin);
+        response.setHeader("Access-Control-Allow-Credentials", "true");
         response.setHeader("Vary", "Origin");
         response.setHeader(
             "Access-Control-Allow-Methods",
-            "GET, POST, DELETE, OPTIONS",
+            "GET, POST, PATCH, DELETE, OPTIONS",
         );
         response.setHeader("Access-Control-Allow-Headers", "Content-Type");
     }
@@ -1585,6 +1594,7 @@ try {
 }
 
 const hasFrontend = await pathExists(FRONTEND_INDEX);
+await migrateLegacyState();
 
 function requireJson(request, response, next) {
     if (!request.is("application/json")) {
@@ -1602,10 +1612,11 @@ app.get("/api/health", (request, response) => {
 
 app.get("/api/token", async (request, response, next) => {
     try {
-        const { session, renewed } = await ensureValidSession();
+        const { account } = requireWebSession(request);
+        const auth = await ensureAccountToken(account);
         response.json({
-            ...sessionPayload(session, renewed),
-            message: renewed ? "Token renovado." : "Token actual.",
+            ...sessionPayload(auth.account, auth.token, auth.renewed),
+            message: auth.renewed ? "Token renovado." : "Token actual.",
         });
     } catch (error) {
         next(error);
@@ -1614,12 +1625,11 @@ app.get("/api/token", async (request, response, next) => {
 
 app.post("/api/token/refresh", requireJson, async (request, response, next) => {
     try {
-        const { session, renewed } = await refreshSession();
+        const { account } = requireWebSession(request);
+        const auth = await refreshAccount(account);
         response.json({
-            ...sessionPayload(session, renewed),
-            message: renewed
-                ? "Token renovado correctamente."
-                : "Token actual.",
+            ...sessionPayload(auth.account, auth.token, true),
+            message: "Token renovado correctamente.",
         });
     } catch (error) {
         next(error);
@@ -1643,15 +1653,21 @@ app.post("/api/login", requireJson, async (request, response, next) => {
         }
 
         const normalizedUsername = username.trim();
-        const session = await enqueueAuthentication(() =>
+        const { account, token } = await enqueueAuthentication(() =>
             loginAndPersist(normalizedUsername, password),
         );
 
+        const previousSession = request.cookies?.[WEB_SESSION_COOKIE];
+        if (previousSession) {
+            deleteWebSession(hashSessionId(previousSession));
+        }
+        startWebSession(response, account.id);
+
         response.json({
-            ...sessionPayload(session),
+            ...sessionPayload(account, token),
             message:
                 "Autenticación correcta. La sesión se renovará cuando sea necesario.",
-            saved_to: SESSION_FILE_NAME,
+            saved_to: DATABASE_FILE_NAME,
         });
     } catch (error) {
         next(error);
@@ -1660,11 +1676,26 @@ app.post("/api/login", requireJson, async (request, response, next) => {
 
 app.post("/api/logout", requireJson, async (request, response, next) => {
     try {
-        await clearSession();
+        endWebSession(request, response);
         response.json({
             status: "ok",
             message:
-                "Sesión eliminada. Las credenciales guardadas se han borrado.",
+                "Sesión del navegador cerrada. La cuenta y la configuración de Telegram permanecen guardadas hasta que se eliminen.",
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.delete("/api/account", async (request, response, next) => {
+    try {
+        const { account } = requireWebSession(request);
+        deleteAccountData(account.usernameKey);
+        endWebSession(request, response);
+        response.json({
+            status: "ok",
+            message:
+                "Cuenta eliminada del servidor, junto con su estado de lectura y la configuración de Telegram.",
         });
     } catch (error) {
         next(error);
@@ -1673,7 +1704,8 @@ app.post("/api/logout", requireJson, async (request, response, next) => {
 
 app.get("/api/inbox", async (request, response, next) => {
     try {
-        const { inbox } = await fetchInboxData();
+        const { account } = requireWebSession(request);
+        const { inbox } = await fetchInboxData(account);
 
         response.set("Cache-Control", "no-store");
         response.json({
@@ -1691,7 +1723,7 @@ app.post(
     requireJson,
     async (request, response, next) => {
         try {
-            const session = await requireSession();
+            const { account } = requireWebSession(request);
             const { uuid } = request.params;
 
             if (!UUID_PATTERN.test(uuid)) {
@@ -1721,12 +1753,16 @@ app.post(
                 );
             }
 
-            const read = await markMessageLocallyRead(
-                session.username,
+            const read = markMessageLocallyRead(
+                account.usernameKey,
                 uuid,
                 matriculaIds,
             );
-            const portalUpdated = await markPortalRead(matriculaIds, uuid);
+            const portalUpdated = await markPortalRead(
+                account,
+                matriculaIds,
+                uuid,
+            );
 
             response.json({
                 status: "ok",
@@ -1748,6 +1784,7 @@ app.post(
 
 app.get("/api/attachments/:uuid", async (request, response, next) => {
     try {
+        const { account } = requireWebSession(request);
         const { uuid } = request.params;
 
         if (!UUID_PATTERN.test(uuid)) {
@@ -1758,6 +1795,7 @@ app.get("/api/attachments/:uuid", async (request, response, next) => {
         }
 
         const portalResponse = await portalRequestWithAuth(
+            account,
             `/adjuntos/${encodeURIComponent(uuid)}`,
             { headers: { Accept: "*/*" } },
         );
@@ -1791,8 +1829,8 @@ app.get("/api/attachments/:uuid", async (request, response, next) => {
 
 app.get("/api/telegram", async (request, response, next) => {
     try {
-        const session = await requireSession();
-        const config = await getTelegramConfig(session.username);
+        const { account } = requireWebSession(request);
+        const config = getTelegramSettings(account.usernameKey);
         response.json(publicTelegramConfig(config));
     } catch (error) {
         next(error);
@@ -1801,7 +1839,7 @@ app.get("/api/telegram", async (request, response, next) => {
 
 app.post("/api/telegram", requireJson, async (request, response, next) => {
     try {
-        const session = await requireSession();
+        const { account } = requireWebSession(request);
         const { bot_token, chat_id, enabled } = request.body ?? {};
 
         if (bot_token !== undefined && typeof bot_token !== "string") {
@@ -1812,17 +1850,17 @@ app.post("/api/telegram", requireJson, async (request, response, next) => {
         }
 
         const wantsEnabled = enabled !== false;
-        const saved = await saveTelegramConfig(session.username, {
+        const saved = await saveTelegramConfig(account.usernameKey, {
             botToken: typeof bot_token === "string" ? bot_token : "",
             chatId: typeof chat_id === "string" ? chat_id : "",
             enabled: wantsEnabled,
         });
 
         if (saved.enabled && !saved.initialized) {
-            await baselineTelegram(session.username);
+            await baselineTelegram(account.usernameKey, account);
         }
 
-        const config = await getTelegramConfig(session.username);
+        const config = getTelegramSettings(account.usernameKey);
         response.json({
             ...publicTelegramConfig(config),
             message: saved.enabled
@@ -1836,7 +1874,7 @@ app.post("/api/telegram", requireJson, async (request, response, next) => {
 
 app.post("/api/telegram/test", requireJson, async (request, response, next) => {
     try {
-        const session = await requireSession();
+        const { account } = requireWebSession(request);
         const { bot_token, chat_id } = request.body ?? {};
 
         if (bot_token !== undefined && typeof bot_token !== "string") {
@@ -1846,10 +1884,13 @@ app.post("/api/telegram/test", requireJson, async (request, response, next) => {
             throw new ApiError(422, "El chat ID no es válido.");
         }
 
-        const credentials = await resolveTelegramCredentials(session.username, {
-            botToken: typeof bot_token === "string" ? bot_token : "",
-            chatId: typeof chat_id === "string" ? chat_id : "",
-        });
+        const credentials = await resolveTelegramCredentials(
+            account.usernameKey,
+            {
+                botToken: typeof bot_token === "string" ? bot_token : "",
+                chatId: typeof chat_id === "string" ? chat_id : "",
+            },
+        );
 
         if (!credentials.chatId) {
             throw new ApiError(
@@ -1878,7 +1919,7 @@ app.post(
     requireJson,
     async (request, response, next) => {
         try {
-            const session = await requireSession();
+            const { account } = requireWebSession(request);
             const { bot_token } = request.body ?? {};
 
             if (bot_token !== undefined && typeof bot_token !== "string") {
@@ -1886,7 +1927,7 @@ app.post(
             }
 
             const { token } = await resolveTelegramCredentials(
-                session.username,
+                account.usernameKey,
                 {
                     botToken: typeof bot_token === "string" ? bot_token : "",
                 },
@@ -1908,10 +1949,8 @@ app.post(
 
 app.delete("/api/telegram", async (request, response, next) => {
     try {
-        const session = await requireSession();
-        await updateTelegramStore((store) => {
-            delete store.users[session.username];
-        });
+        const { account } = requireWebSession(request);
+        deleteTelegramSettings(account.usernameKey);
         response.json({
             status: "ok",
             message: "Integración con Telegram eliminada.",
@@ -1983,7 +2022,9 @@ if (isMainModule) {
     app.listen(PORT, HOST, () => {
         console.log(`API de Stilus escuchando en http://${HOST}:${PORT}`);
         console.log(`Python: ${python}`);
-        console.log(`Sesión: ${SESSION_FILE_NAME} · renovación bajo demanda`);
+        console.log(
+            `Base de datos: ${DATABASE_FILE_NAME} · sesiones por cookie y renovación bajo demanda`,
+        );
         console.log(
             hasFrontend
                 ? `Frontend: ${FRONTEND_DIR}`
@@ -2005,7 +2046,5 @@ export {
     loginAndPersist,
     pollTelegramNotifications,
     publicTelegramConfig,
-    readSession,
-    releaseTelegramLock,
     saveTelegramConfig,
 };

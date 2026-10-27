@@ -10,7 +10,7 @@ There are two supported ways to use the project:
 | Option                  | Host requirements                                               | Recommended for                                   |
 | ----------------------- | --------------------------------------------------------------- | ------------------------------------------------- |
 | **Docker**              | Docker Engine/Desktop 24+ with Docker Compose v2. Nothing else. | Normal use and servers.                           |
-| **Manual installation** | Python 3.10+, Node.js 18.18+, Firefox and geckodriver.          | Development or modifying the code without Docker. |
+| **Manual installation** | Python 3.10+, Node.js 20+, Firefox and geckodriver.             | Development or modifying the code without Docker. |
 
 ### Option A — Docker (recommended)
 
@@ -50,14 +50,17 @@ To run the web UI, API and Telegram CLI at the same time:
 docker compose --profile web --profile telegram up -d --build
 ```
 
-> **Warning:** both services share the `stilus-data` volume and the
-> `telegram.lock` lock. The lock prevents duplicate Telegram sends, but both
-> processes poll Stilus and share the same session. Running just one profile is
-> recommended.
+> **Multi-user:** each browser gets its own HttpOnly session cookie and can log
+> in with a different Stilus account. Accounts, encrypted tokens and Telegram
+> state live in SQLite. The web server and the optional Telegram CLI use
+> per-account database locks to avoid duplicate notifications. Both profiles may
+> run with a warning: a simultaneous token refresh for the same account can
+> still race, so the web profile alone is recommended.
 
-Docker state is stored in the named volume `stilus-data`; it is separate from
-the host's local `session.json` and `telegram.json`. `docker compose down` keeps
-the volume, while `docker compose down -v` deletes it.
+Docker state is stored in SQLite inside the named volume `stilus-data`. The old
+`session.json`, `read-state.json` and `telegram.json` files are imported and
+removed automatically the first time the new version starts. `docker compose
+down` keeps the volume, while `docker compose down -v` deletes it.
 
 See the [Docker reference](#docker-reference) for the environment variables,
 volume details, architectures, commands and troubleshooting.
@@ -107,7 +110,7 @@ configuration, command-line usage, production builds and tooling.
 ### Requirements
 
 - Python 3.10 or newer (the code uses `X | Y` type unions).
-- Node.js 18.18 or newer for the Express API and tooling.
+- Node.js 20 or newer for the Express API and tooling.
 - Firefox.
 - `geckodriver` — optional in `config.yaml`; if omitted, Selenium Manager
   locates or downloads it.
@@ -239,37 +242,56 @@ Python files are ignored by Prettier; the existing Python code already uses
 4-space style. ESLint is kept on the 9.x line because `eslint-plugin-react`
 currently declares support up to ESLint 9.
 
-## Web login and token renewal
+## Web login, multi-session and token renewal
 
-The React frontend provides a login form that runs `get_token.py` through a
-small Express API. After a successful login the API stores a session in
-`session.json` (git-ignored):
+The React frontend provides a login form that runs `get_token.py` through the
+Express API. After a successful login the API stores an account record in
+SQLite (`stilus.sqlite`, git-ignored):
 
-- The access token and its generation time.
-- Your username and password, encrypted with AES-256-GCM.
+- One row per Stilus username, with the access token, its generation time and
+  the credentials encrypted with AES-256-GCM.
+- Web sessions bound to the browser through an `HttpOnly`, `SameSite=Lax`
+  cookie (`stilus_session`). The cookie contains a random identifier; only its
+  SHA-256 hash is stored in SQLite.
 
 The encryption key is generated locally in `.session.key` (mode `0600`,
-git-ignored).
+git-ignored). The database file and its WAL files use mode `0600` when possible,
+and the data directory uses `0700`.
+
+Different browsers can be logged in with different Stilus accounts at the same
+time. Requests are resolved through each browser's cookie, so one user's inbox,
+read state and Telegram configuration never overwrite another user's data. Two
+browsers using the same Stilus account share that account's token, read state
+and Telegram configuration, which is the expected behaviour for the same
+account on two devices.
 
 The server uses the stored token while its JWT `exp` is in the future. It reads
 `exp` internally only to detect actual expiry; it does **not** renew early and
 does **not** run a background renewal timer. When `exp` has passed, the next
 request to Stilus renews the token once with the stored credentials and
-continues. A portal `401` triggers the same renewal. If the portal rejects the
-stored credentials, the session is removed and the login form is shown again.
+continues. A portal `401` triggers the same renewal. Renewals are single-flight
+per account. If the portal rejects the stored credentials, that account's token,
+credentials and browser sessions are invalidated while its read state and
+Telegram configuration remain in SQLite; the login form is shown again.
 
-Logging out with "Olvidar sesión" deletes `session.json`. The password is sent
-to `get_token.py` through stdin and never placed in process arguments.
+"Renovar token" in the account menu forces a new login. "Cerrar sesión" removes
+only the current browser cookie and session, so the account can keep renewing
+and sending Telegram notifications. "Eliminar cuenta y datos guardados" deletes
+the account, its sessions, read state and Telegram configuration.
 
-The API exposes `GET /api/token` so other local tools can obtain the current
-token without running Selenium. It renews only if the stored token is already
-expired. `POST /api/token/refresh` forces a new login and token, and
-`POST /api/logout` deletes the stored session.
+The API exposes `GET /api/token` so authenticated browser tools can obtain the
+current account token without running Selenium. It renews only if the stored
+token is already expired. `POST /api/token/refresh` forces a new login and
+token, `POST /api/logout` closes the browser session, and `DELETE /api/account`
+deletes the account and its saved data.
 
-> `session.json`, `telegram.json` and `.session.key` live on this machine.
+The password is sent to `get_token.py` through stdin and never placed in process
+arguments.
+
+> `stilus.sqlite`, `.session.key` and the old JSON files live on this machine.
 > Anyone with access to your user account and these files can decrypt the
 > password and bot token, so protect your account and do not commit them. For
-> stronger isolation, use the OS keychain.
+> stronger isolation, use full-disk encryption or a secrets manager.
 
 ## Inbox
 
@@ -281,7 +303,7 @@ When a session is active, the frontend shows the family inbox:
 - You can search by subject, sender or text, filter unread messages, filter by
   child and select one or more grouped senders in a multi-select dropdown.
 - Opening an unread message marks it as read in Stilus and stores the state in
-  `read-state.json` (git-ignored), keyed by user and message UUID.
+  SQLite (`read_state`), keyed by the logged-in Stilus account and message UUID.
 - Messages with attachments show a paperclip counter; attachments are listed
   before the message body and can be downloaded individually or all at once.
 - If Stilus returns a `5xx` error, the inbox shows a specific warning stating
@@ -310,16 +332,17 @@ You can configure a Telegram bot from the account menu (top right) →
 3. Paste the token, click **Detectar** to obtain the chat ID, enable
    notifications and save.
 
-The bot token is encrypted with AES-256-GCM and stored in `telegram.json`
-(git-ignored, mode `0600`). It is never sent back to the browser; only its last
-four characters are shown as a hint.
+The bot token is encrypted with AES-256-GCM and stored in SQLite
+(`telegram_settings`), together with the per-account notified-message list. It
+is never sent back to the browser; only its last four characters are shown as a
+hint.
 
-Once configured, the server checks for new messages every 5 minutes,
-independently of whether the web UI is open. Each new message is sent to the
-configured chat with its subject, sender, children, date, type and full text.
-Attachments are downloaded from Stilus and sent as Telegram documents. The
+Once configured, the server checks all accounts with Telegram enabled every 5
+minutes, independently of whether the web UI is open. Each new message is sent
+to the configured chat with its subject, sender, children, date, type and full
+text. Attachments are downloaded from Stilus and sent as Telegram documents. The
 **Probar** button sends a test message, and **Eliminar integración** removes the
-stored token and stops notifications.
+stored token and stops notifications for that account.
 
 On the first configuration, the current messages are marked as already
 notified, so only messages received after that moment are sent. If the server is
@@ -369,9 +392,9 @@ npm run telegram -- --stop
 
 The CLI writes `server/telegram-cli.log` and `server/telegram-cli.pid` (both
 git-ignored). The first run marks the current messages as already notified;
-later runs send messages that arrived since the previous run. It reuses
-`session.json` and `telegram.json`, so the bot token is encrypted and the Stilus
-token is renewed automatically.
+later runs send messages that arrived since the previous run. It shares the
+SQLite account and Telegram state with the web server; tokens are encrypted and
+renewed automatically.
 
 For sensitive values, use environment variables instead of arguments:
 
@@ -381,9 +404,9 @@ TELEGRAM_BOT_TOKEN="..." STILUS_USER="..." STILUS_PASSWORD="..." \
 ```
 
 `STILUS_PASSWORD` and `TELEGRAM_BOT_TOKEN` avoid exposing the secrets in the
-process list. The CLI and the web server share `session.json` and
-`telegram.json`; a lock file (`telegram.lock`) prevents duplicate notifications,
-but running both at the same time is unnecessary.
+process list. The CLI polls only the account it signs in with. If the web server
+is also running, per-account database locks prevent duplicate notifications; the
+web server continues polling other accounts.
 
 For Docker, use the `telegram` profile instead of `--detach`; see the
 [Docker reference](#docker-reference).
@@ -423,14 +446,17 @@ cp .env.example .env
 available variables. The web profile does not need Telegram credentials; users
 log in through the UI.
 
-| Variable              | Used by  | Default     | Description                                                        |
-| --------------------- | -------- | ----------- | ------------------------------------------------------------------ |
-| `TELEGRAM_BOT_TOKEN`  | telegram | empty       | Bot token from `@BotFather`. Required for the Telegram profile.    |
-| `TELEGRAM_CHAT_ID`    | telegram | empty       | Destination chat. If empty, the CLI tries to detect it.            |
-| `STILUS_USER`         | telegram | empty       | Educa username for the CLI login.                                  |
-| `STILUS_PASSWORD`     | telegram | empty       | Educa password for the CLI login.                                  |
-| `STILUS_BIND_ADDRESS` | web      | `127.0.0.1` | Host bind address. Use `0.0.0.0` for LAN access.                   |
-| `STILUS_WEB_PORT`     | web      | `8000`      | Host port for the web UI. Change it if the port is already in use. |
+| Variable              | Used by  | Default      | Description                                                               |
+| --------------------- | -------- | ------------ | ------------------------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`  | telegram | empty        | Bot token from `@BotFather`. Required for the Telegram profile.           |
+| `TELEGRAM_CHAT_ID`    | telegram | empty        | Destination chat. If empty, the CLI tries to detect it.                   |
+| `STILUS_USER`         | telegram | empty        | Educa username for the CLI login.                                         |
+| `STILUS_PASSWORD`     | telegram | empty        | Educa password for the CLI login.                                         |
+| `STILUS_BIND_ADDRESS` | web      | `127.0.0.1`  | Host bind address. Use `0.0.0.0` for LAN access.                          |
+| `STILUS_WEB_PORT`     | web      | `8000`       | Host port for the web UI. Change it if the port is already in use.        |
+| `STILUS_DATA_PATH`    | both     | named volume | Absolute host path for `/data` (Unraid: `/mnt/user/appdata/stilus/data`). |
+| `PUID` / `PGID`       | both     | `10001`      | UID/GID for the container process. Unraid commonly uses `99:100`.         |
+| `COOKIE_SECURE`       | web      | `false`      | Set to `true` when the UI is served through HTTPS.                        |
 
 Inside the containers the image sets:
 
@@ -440,6 +466,11 @@ STILUS_CONFIG=/app/config.docker.yaml
 PYTHON=/opt/venv/bin/python
 HOST=0.0.0.0
 PORT=8000
+
+# Compose adds:
+HOME=/tmp
+TMPDIR=/tmp
+COOKIE_SECURE=false
 ```
 
 `config.docker.yaml` contains only the Stilus URL and the geckodriver path. It
@@ -463,8 +494,10 @@ STILUS_BIND_ADDRESS=0.0.0.0
 STILUS_WEB_PORT=8000
 ```
 
-The API has no authentication layer of its own beyond the Stilus session. Do
-not expose it to an untrusted network without a reverse proxy and HTTPS.
+The API uses the browser's `HttpOnly` session cookie to select the Stilus
+account. There is no separate application password beyond the Stilus login. Do
+not expose the port to an untrusted network without a reverse proxy and HTTPS;
+set `COOKIE_SECURE=true` when HTTPS is in use.
 
 ### Start the Telegram-only profile
 
@@ -494,30 +527,76 @@ container.
 docker compose --profile web --profile telegram up -d --build
 ```
 
-> **Warning:** both services share the `stilus-data` volume and the
-> `telegram.lock` lock. The lock prevents duplicate Telegram sends, but both
-> processes poll Stilus and share the same session. Running just one profile is
-> recommended. If both run, a token renewal can race; stop one of them if you
-> see unexpected session errors.
+The web server polls every account that has Telegram enabled. The CLI polls
+only the account it signs in with. Both use per-account rows in the
+`telegram_locks` SQLite table, so a message is not sent twice.
+
+> **Warning:** running both profiles is supported, but both may try to refresh
+> the same account's token at the same time. Prefer the `web` profile alone; it
+> already polls Telegram. Use the `telegram` profile only if you do not need the
+> UI, or keep it for an account not used by the web login.
 
 ### Persistent data
 
 The named volume `stilus-data` is mounted at `/data` and stores:
 
-- `session.json`
+- `stilus.sqlite` plus its `-wal`/`-shm` files
 - `.session.key`
-- `read-state.json`
-- `telegram.json`
-- `telegram.lock`
+
+The database contains accounts, encrypted tokens and credentials, browser
+sessions (hashed identifiers), read state, Telegram settings, notified messages
+and locks. Old installations' `session.json`, `read-state.json` and
+`telegram.json` are imported into SQLite and removed on first startup.
+
+Back up the whole data directory while the stack is stopped. The database and
+`.session.key` are both required; without the key the encrypted tokens and
+credentials cannot be recovered.
 
 `docker compose down` keeps the volume. `docker compose down -v` deletes it,
-including the saved session and Telegram configuration. Docker starts with its
-own empty state; existing host-side session files are not copied automatically.
+including all accounts, sessions, read state and Telegram configuration. Docker
+starts with its own empty state; existing host-side files are not copied
+automatically.
 
-The container runs as the unprivileged `app` user (UID 10001), and `/data` is
-created with mode `0700` and owned by that user. Session files are written with
-mode `0600`. The web server and the CLI share the same volume, session, read
-state and Telegram lock.
+The container runs with the UID/GID from `PUID`/`PGID` (default `10001:10001`).
+The image creates `/data` for the default user with mode `0700`; database and key
+files are written with mode `0600`. The web server and CLI share the same
+volume and coordinate through SQLite locks.
+
+### Unraid
+
+Unraid appdata is normally owned by `nobody:users` (`99:100`). Set these values in
+`.env` or in the stack environment:
+
+```dotenv
+PUID=99
+PGID=100
+STILUS_DATA_PATH=/mnt/user/appdata/stilus/data
+```
+
+Then make sure the bind-mounted data directory is writable by that user:
+
+```bash
+mkdir -p /mnt/user/appdata/stilus/data
+chown -R 99:100 /mnt/user/appdata/stilus/data
+chmod 700 /mnt/user/appdata/stilus/data
+```
+
+With `STILUS_DATA_PATH` set, Compose bind-mounts that directory at `/data`.
+The container also sets `HOME=/tmp` so Firefox/Selenium do not need a writable
+home directory in appdata. If you use a named volume instead of a bind mount,
+create it with the same UID/GID or run `chown -R 99:100` inside it once.
+
+After recreating the stack, verify permissions from inside the running web
+container:
+
+```bash
+docker compose --profile web exec server sh -c \
+  'id && touch /data/.write-test && rm /data/.write-test'
+```
+
+The command should report UID 99 and finish without `Permission denied`. On
+first start, the logs should mention that legacy JSON data was migrated to
+SQLite. Log in once from each browser; cookies keep the accounts separate.
 
 ### Useful commands
 
@@ -535,7 +614,7 @@ docker compose --profile web down
 docker compose --profile telegram down
 docker compose --profile web --profile telegram down
 
-# Stop and delete session/Telegram data
+# Stop and delete all accounts, sessions, read state and Telegram data
 docker compose --profile web --profile telegram down -v
 
 # Rebuild after changing source or the Dockerfile
@@ -548,13 +627,16 @@ profile-scoped. This is intentional.
 
 ### Image details
 
-- Multi-stage build: Vite frontend build followed by the runtime image.
+- Multi-stage build: Vite frontend, server dependencies (including the native
+  SQLite module) and the runtime image.
 - Runtime base: `node:20-bookworm`.
 - Python 3.11 virtual environment with `requirements.txt`.
 - Debian Firefox ESR.
 - Geckodriver pinned to **0.37.1**.
+- SQLite database in `/data`; no external database container is required.
 - Frontend compiled into `frontend/dist` and served by Express.
-- Non-root `app` user, `init: true`, `shm_size: 1gb` for Firefox.
+- Runs with `PUID`/`PGID` (default non-root UID/GID 10001), `init: true`,
+  `shm_size: 1gb` for Firefox.
 - Healthcheck against `/api/health` for the web service.
 
 The image supports `linux/amd64` and `linux/arm64`. BuildKit supplies
@@ -565,32 +647,46 @@ its runtime dependencies.
 
 ### Verification performed
 
-The `amd64` image was built and tested:
+The previous `amd64` image was built and tested: the web container started, the
+frontend and `/api/health` responded, Firefox/geckodriver started, the Stilus
+login page loaded and the Telegram CLI `--help` worked.
 
-- Web container starts, `/api/health` returns `200`.
-- The compiled frontend is served at the web port.
-- `/data` is writable by the `app` user.
-- Firefox ESR 153.5.0 and geckodriver 0.37.1 start inside the container.
-- The Stilus login page loads from inside the container.
-- The Telegram CLI `--help` works inside the image.
-- Prettier, ESLint and `docker compose config` pass.
+For this multi-user revision, the Node server and SQLite layer were tested
+directly on Node 20:
+
+- Two browser cookie jars logged in as two different accounts and received
+  their own usernames from `/api/token`; logging out one left the other intact.
+- An expired migrated token was renewed automatically, and a valid token was
+  not renewed again.
+- Legacy `session.json`, `read-state.json` and `telegram.json` were migrated to
+  SQLite and removed.
+- The Telegram configuration and account-deletion endpoints worked with the
+  session cookie.
+- The frontend production build, Prettier, ESLint, `node --check` and
+  `docker compose config` pass.
+
+The Docker daemon on the development machine was unresponsive at the end, so
+the current SQLite revision could not be rebuilt into the image there. Rebuild it
+on the target before deploying. The Dockerfile downloads native/server
+dependencies and keeps build tools out of the runtime stage.
 
 For `arm64`, Debian's Firefox ESR package and the geckodriver `linux-aarch64`
-release were verified. A complete `arm64` build on this x86 host through QEMU
-failed during the emulated `pip install` because PyPI was unreachable from the
-emulated environment; the Dockerfile itself is architecture-aware. A native
-ARM host (Apple Silicon or an ARM server) should build it without emulation.
+release were verified. A complete `arm64` build on the earlier x86 host through
+QEMU failed during the emulated `pip install` because PyPI was unreachable; the
+Dockerfile itself is architecture-aware. A native ARM host (Apple Silicon or an
+ARM server) should build it without emulation.
 
 ### Docker troubleshooting
 
-| Problem                                   | Check                                                                                    |
-| ----------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `docker compose up` starts no services    | Both services use profiles. Pass `--profile web`, `--profile telegram`, or both.         |
-| The web port is already in use            | Set `STILUS_WEB_PORT` in `.env` or stop the process using port 8000.                     |
-| The web UI is not reachable from the LAN  | Set `STILUS_BIND_ADDRESS=0.0.0.0` and check the host firewall.                           |
-| The Telegram container exits repeatedly   | Check `.env`: bot token, username and password are required; inspect `logs -f telegram`. |
-| Telegram cannot detect a chat             | Open the bot, send `/start`, or set `TELEGRAM_CHAT_ID` explicitly.                       |
-| Both profiles produce duplicate work      | The lock prevents duplicate Telegram sends, but stop one profile; see the warning above. |
-| Session/Telegram data disappeared         | `docker compose down -v` deletes the named volume.                                       |
-| The image needs a rebuild after changes   | Run `up -d --build` again; Docker reuses cached layers where possible.                   |
-| Docker build cannot download dependencies | The build needs access to Docker Hub, Debian repositories, GitHub and PyPI.              |
+| Problem                                   | Check                                                                                                                                                                  |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker compose up` starts no services    | Both services use profiles. Pass `--profile web`, `--profile telegram`, or both.                                                                                       |
+| The web port is already in use            | Set `STILUS_WEB_PORT` in `.env` or stop the process using port 8000.                                                                                                   |
+| The web UI is not reachable from the LAN  | Set `STILUS_BIND_ADDRESS=0.0.0.0` and check the host firewall.                                                                                                         |
+| The Telegram container exits repeatedly   | Check `.env`: bot token, username and password are required; inspect `logs -f telegram`.                                                                               |
+| Telegram cannot detect a chat             | Open the bot, send `/start`, or set `TELEGRAM_CHAT_ID` explicitly.                                                                                                     |
+| Both profiles run at once                 | Supported with a warning: database locks prevent duplicate Telegram sends, but simultaneous token refresh for the same account can race. Prefer the web profile alone. |
+| Permission denied writing `/data`         | Set `PUID`/`PGID` to the owner of the bind mount (Unraid: `99:100`) and `chown -R` the appdata directory.                                                              |
+| Session/Telegram data disappeared         | `docker compose down -v` deletes the named volume.                                                                                                                     |
+| The image needs a rebuild after changes   | Run `up -d --build` again; Docker reuses cached layers where possible.                                                                                                 |
+| Docker build cannot download dependencies | The build needs access to Docker Hub, Debian repositories, GitHub and PyPI.                                                                                            |

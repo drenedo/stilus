@@ -11,6 +11,8 @@ session.json
 read-state.json
 telegram.json
 telegram.lock
+stilus.sqlite
+stilus.sqlite-*
 token.json
 children.json
 *.json.tmp

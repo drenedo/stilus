@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Inbox from "./Inbox";
 import LoginScreen from "./LoginScreen";
-import { getToken, login, logout, refreshToken } from "./api";
+import { deleteAccount, getToken, login, logout, refreshToken } from "./api";
 
 const TOKEN_POLL_MS = 5 * 60 * 1000;
 const THEME_STORAGE_KEY = "stilus.theme";
@@ -222,6 +222,33 @@ export default function App() {
         }
     }, []);
 
+    const handleDeleteAccount = useCallback(async () => {
+        if (
+            !window.confirm(
+                "¿Eliminar la cuenta guardada, su estado de lectura y la configuración de Telegram? Esta acción no se puede deshacer.",
+            )
+        ) {
+            return false;
+        }
+
+        setLoggingOut(true);
+
+        try {
+            await deleteAccount();
+            setSession(null);
+            setStatus({
+                type: "success",
+                message: "Cuenta y datos guardados eliminados.",
+            });
+            return true;
+        } catch (error) {
+            setStatus({ type: "error", message: error.message });
+            return false;
+        } finally {
+            setLoggingOut(false);
+        }
+    }, []);
+
     if (session) {
         return (
             <Inbox
@@ -230,6 +257,7 @@ export default function App() {
                 onRefresh={handleRefresh}
                 refreshing={refreshing}
                 onLogout={handleLogout}
+                onDeleteAccount={handleDeleteAccount}
                 loggingOut={loggingOut}
                 onUnauthorized={handleUnauthorized}
                 theme={theme}
