@@ -1,0 +1,65 @@
+name: stilus
+
+x-app: &app
+    build:
+        context: .
+        dockerfile: Dockerfile
+    image: stilus:local
+    init: true
+    user: "${PUID:-10001}:${PGID:-10001}"
+    shm_size: "1gb"
+    restart: unless-stopped
+
+services:
+    server:
+        <<: *app
+        profiles:
+            - web
+        command: ["node", "server/index.js"]
+        ports:
+            - "${STILUS_BIND_ADDRESS:-127.0.0.1}:${STILUS_WEB_PORT:-8000}:8000"
+        environment:
+            HOST: "0.0.0.0"
+            PORT: "8000"
+            PYTHON: /opt/venv/bin/python
+            STILUS_CONFIG: /app/config.docker.yaml
+            STILUS_DATA_DIR: /data
+            HOME: /tmp
+            TMPDIR: /tmp
+            COOKIE_SECURE: ${COOKIE_SECURE:-false}
+        volumes:
+            - ${STILUS_DATA_PATH:-stilus-data}:/data
+        healthcheck:
+            test:
+                [
+                    "CMD",
+                    "node",
+                    "-e",
+                    "fetch('http://127.0.0.1:8000/api/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))",
+                ]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 30s
+
+    telegram:
+        <<: *app
+        profiles:
+            - telegram
+        restart: on-failure:5
+        command: ["node", "server/telegram-cli.js", "--interval", "5"]
+        environment:
+            PYTHON: /opt/venv/bin/python
+            STILUS_CONFIG: /app/config.docker.yaml
+            STILUS_DATA_DIR: /data
+            HOME: /tmp
+            TMPDIR: /tmp
+            TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+            TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+            STILUS_USER: ${STILUS_USER:-}
+            STILUS_PASSWORD: ${STILUS_PASSWORD:-}
+        volumes:
+            - ${STILUS_DATA_PATH:-stilus-data}:/data
+
+volumes:
+    stilus-data:
