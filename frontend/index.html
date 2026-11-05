@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="es">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="theme-color" content="#0b1220" />
+        <meta
+            name="description"
+            content="Inicia sesión en Stilus y guarda tu token de sesión."
+        />
+        <title>Stilus · Acceso</title>
+        <script>
+            (() => {
+                let theme = "dark";
+                try {
+                    const stored = localStorage.getItem("stilus.theme");
+                    theme =
+                        stored === "light" || stored === "dark"
+                            ? stored
+                            : window.matchMedia("(prefers-color-scheme: light)")
+                                    .matches
+                              ? "light"
+                              : "dark";
+                } catch {
+                    theme = window.matchMedia("(prefers-color-scheme: light)")
+                        .matches
+                        ? "light"
+                        : "dark";
+                }
+
+                document.documentElement.dataset.theme = theme;
+                document.documentElement.style.colorScheme = theme;
+
+                const themeColor = document.querySelector(
+                    'meta[name="theme-color"]',
+                );
+                if (themeColor) {
+                    themeColor.setAttribute(
+                        "content",
+                        theme === "light" ? "#edf3f8" : "#0b1220",
+                    );
+                }
+            })();
+        </script>
+    </head>
+    <body>
+        <div id="root"></div>
+        <script type="module" src="/src/main.jsx"></script>
+    </body>
+</html>
