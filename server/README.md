@@ -184,7 +184,16 @@ Timeout: 120 seconds. The browser/API error mapping is:
 | Other unexpected error            | `500`  |
 
 `get_token.py` opens Firefox headless through Selenium, fills the ADFS login
-form and reads the token from the redirect URL fragment.
+form and reads the token from the redirect URL fragment. It waits
+`login_timeout` seconds (default 45) for the ADFS form on each attempt and
+retries transient browser/portal failures up to `login_attempts` times
+(default 2), always within `login_budget` seconds (default 110) so the child
+process exits cleanly before the server's hard 120 s limit.
+
+If the login does not complete, the log includes the URL and title of the page
+that was actually rendered, plus a screenshot path. Set `STILUS_DEBUG_DIR` to
+choose where screenshots are written (default `/tmp`; Compose uses
+`/data/debug` inside the volume).
 
 ### Account and browser-session storage
 
@@ -761,26 +770,26 @@ root README for the exact commands, profiles, volume and environment variables.
 
 ## Troubleshooting
 
-| Problem                                                        | Check                                                                                                                                     |
-| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `No se encontró un intérprete de Python con PyYAML y Selenium` | Create `venv` and install the root `requirements.txt`; or set `PYTHON`.                                                                   |
-| `ModuleNotFoundError: yaml` / `selenium`                       | The selected Python is not the venv; restart with `PYTHON=/path/to/venv/bin/python`.                                                      |
-| Login fails with `401`                                         | Wrong Educa credentials. The stored session was removed if this happened during a token renewal.                                          |
-| Login times out (`504`)                                        | Portal/network issue; the session is kept and retried.                                                                                    |
-| `Geckodriver not found`                                        | Point `geckodriver` in `config.yaml` to a valid binary, or remove it and let Selenium Manager resolve it.                                 |
-| Firefox does not start                                         | Install Firefox or check the geckodriver/Firefox version compatibility.                                                                   |
-| `415` on a POST                                                | Send `Content-Type: application/json`.                                                                                                    |
-| `401` from `/api/token`                                        | No session or invalid session; log in again.                                                                                              |
-| `/api/inbox` returns `502/504`                                 | Portal error or timeout; retry. A `401` triggers a forced login and one retry.                                                            |
-| Telegram test fails                                            | Check bot token and chat ID. The user must press `/start` in the bot first.                                                               |
-| Telegram `getUpdates` fails                                    | A webhook may be configured for the bot; remove it or enter the chat ID manually.                                                         |
-| Telegram messages are not sent                                 | Check the account's Telegram settings and `last_error`; the web server must be running and the account must still have valid credentials. |
-| Attachments return `502`                                       | Portal attachment unavailable or session rejected. Retry after a token renewal.                                                           |
-| Port 8000 is already in use                                    | Stop the other process or set `PORT`.                                                                                                     |
-| Telegram poll returns immediately                              | Another process holds that account's row in `telegram_locks`; wait for the 60-minute expiry or stop the other poller.                     |
-| `--stop` says no process                                       | The CLI was running in the foreground or the PID file was removed.                                                                        |
-| Session cannot be decrypted                                    | `.session.key` was deleted/changed. Log in again and re-enter the Telegram bot token.                                                     |
-| Frontend at `/` returns JSON                                   | `frontend/dist` does not exist; run `npm run build` in `frontend/`.                                                                       |
+| Problem                                                        | Check                                                                                                                                                        |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `No se encontró un intérprete de Python con PyYAML y Selenium` | Create `venv` and install the root `requirements.txt`; or set `PYTHON`.                                                                                      |
+| `ModuleNotFoundError: yaml` / `selenium`                       | The selected Python is not the venv; restart with `PYTHON=/path/to/venv/bin/python`.                                                                         |
+| Login fails with `401`                                         | Wrong Educa credentials. The stored session was removed if this happened during a token renewal.                                                             |
+| Login times out (`504`)                                        | Portal/network issue; the session is kept and retried. Check the URL/title and screenshot path logged by `get_token.py` to see whether Firefox reached ADFS. |
+| `Geckodriver not found`                                        | Point `geckodriver` in `config.yaml` to a valid binary, or remove it and let Selenium Manager resolve it.                                                    |
+| Firefox does not start                                         | Install Firefox or check the geckodriver/Firefox version compatibility.                                                                                      |
+| `415` on a POST                                                | Send `Content-Type: application/json`.                                                                                                                       |
+| `401` from `/api/token`                                        | No session or invalid session; log in again.                                                                                                                 |
+| `/api/inbox` returns `502/504`                                 | Portal error or timeout; retry. A `401` triggers a forced login and one retry.                                                                               |
+| Telegram test fails                                            | Check bot token and chat ID. The user must press `/start` in the bot first.                                                                                  |
+| Telegram `getUpdates` fails                                    | A webhook may be configured for the bot; remove it or enter the chat ID manually.                                                                            |
+| Telegram messages are not sent                                 | Check the account's Telegram settings and `last_error`; the web server must be running and the account must still have valid credentials.                    |
+| Attachments return `502`                                       | Portal attachment unavailable or session rejected. Retry after a token renewal.                                                                              |
+| Port 8000 is already in use                                    | Stop the other process or set `PORT`.                                                                                                                        |
+| Telegram poll returns immediately                              | Another process holds that account's row in `telegram_locks`; wait for the 60-minute expiry or stop the other poller.                                        |
+| `--stop` says no process                                       | The CLI was running in the foreground or the PID file was removed.                                                                                           |
+| Session cannot be decrypted                                    | `.session.key` was deleted/changed. Log in again and re-enter the Telegram bot token.                                                                        |
+| Frontend at `/` returns JSON                                   | `frontend/dist` does not exist; run `npm run build` in `frontend/`.                                                                                          |
 
 ## Development notes
 

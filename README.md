@@ -150,6 +150,11 @@ command-line scripts; the web login works with the defaults below:
 url: https://stilus.educa.jcyl.es/ftstfm/
 geckodriver: /snap/bin/firefox.geckodriver
 
+# Optional: login robustness (defaults shown).
+login_timeout: 45 # Seconds to wait for the ADFS form per attempt.
+login_attempts: 2 # Retries for transient browser/portal failures.
+login_budget: 110 # Total seconds; keep it below the server's 120 s limit.
+
 user:
     name: "nombre.apellido@educa.jcyl.es"
     password: "your-password"
@@ -159,13 +164,16 @@ children:
     - 10000002
 ```
 
-| Key             | Description                                                                                                                                      |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `url`           | Portal entry point. Visiting it triggers the sign-in redirect that carries the access token. Defaults to `https://stilus.educa.jcyl.es/ftstfm/`. |
-| `geckodriver`   | Absolute path to the `geckodriver` binary. If omitted, Selenium Manager locates or downloads it automatically.                                   |
-| `user.name`     | Your `@educa.jcyl.es` account.                                                                                                                   |
-| `user.password` | Password for that account.                                                                                                                       |
-| `children`      | Student ids whose communications are fetched. One request is made per id.                                                                        |
+| Key              | Description                                                                                                                                      |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `url`            | Portal entry point. Visiting it triggers the sign-in redirect that carries the access token. Defaults to `https://stilus.educa.jcyl.es/ftstfm/`. |
+| `geckodriver`    | Absolute path to the `geckodriver` binary. If omitted, Selenium Manager locates or downloads it automatically.                                   |
+| `login_timeout`  | Seconds to wait for the ADFS login form on each attempt. Defaults to `45`.                                                                       |
+| `login_attempts` | Attempts used for transient browser or portal failures. Bad credentials are never retried. Defaults to `2`.                                      |
+| `login_budget`   | Overall time budget in seconds for all attempts. Keep it below the server's 120 s limit. Defaults to `110`.                                      |
+| `user.name`      | Your `@educa.jcyl.es` account.                                                                                                                   |
+| `user.password`  | Password for that account.                                                                                                                       |
+| `children`       | Student ids whose communications are fetched. One request is made per id.                                                                        |
 
 The `children` ids are the portal's internal student identifiers, not the
 student's name or document number. You can read them off the portal URL when
@@ -470,11 +478,13 @@ PORT=8000
 # Compose adds:
 HOME=/tmp
 TMPDIR=/tmp
+STILUS_DEBUG_DIR=/data/debug
 COOKIE_SECURE=false
 ```
 
 `config.docker.yaml` contains only the Stilus URL and the geckodriver path. It
-has no credentials.
+has no credentials. Login failures write a screenshot to the `debug` directory
+inside the `/data` volume (`STILUS_DEBUG_DIR`).
 
 ### Start the web profile
 

@@ -24,6 +24,7 @@ services:
             PYTHON: /opt/venv/bin/python
             STILUS_CONFIG: /app/config.docker.yaml
             STILUS_DATA_DIR: /data
+            STILUS_DEBUG_DIR: /data/debug
             HOME: /tmp
             TMPDIR: /tmp
             COOKIE_SECURE: ${COOKIE_SECURE:-false}
@@ -52,6 +53,7 @@ services:
             PYTHON: /opt/venv/bin/python
             STILUS_CONFIG: /app/config.docker.yaml
             STILUS_DATA_DIR: /data
+            STILUS_DEBUG_DIR: /data/debug
             HOME: /tmp
             TMPDIR: /tmp
             TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
